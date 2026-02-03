@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    # Trigger on tag pushes. Adjust pattern as needed (e.g. 'v*.*.*')
+    tags:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            cgo: 0
+          - goos: linux
+            goarch: arm64
+            cgo: 0
+          - goos: linux
+            goarch: 386
+            cgo: 0
+          - goos: linux
+            goarch: arm
+            goarm: '7'
+            cgo: 0
+          - goos: darwin
+            goarch: amd64
+            cgo: 0
+          - goos: darwin
+            goarch: arm64
+            cgo: 0
+          - goos: windows
+            goarch: amd64
+            cgo: 0
+          - goos: windows
+            goarch: 386
+            cgo: 0
+          - goos: android
+            goarch: arm64
+            cgo: 1
+            api: 21
+          - goos: freebsd
+            goarch: amd64
+            cgo: 0
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.5'
+
+      # Install Android NDK only for android rows
+      - name: Setup Android NDK
+        if: matrix.goos == 'android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          ANDROID_API: ${{ matrix.api }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          echo "Building for $GOOS/$GOARCH${GOARM:+/arm$GOARM} (CGO_ENABLED=$CGO_ENABLED)"
+
+          if [ "$GOOS" = "android" ]; then
+            if [ -z "$ANDROID_NDK_HOME" ]; then
+              echo "ANDROID_NDK_HOME is not set – did setup-ndk run?"
+              exit 1
+            fi
+
+            TOOLCHAIN_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+            if [ "$GOARCH" = "arm64" ]; then
+              export CC="$TOOLCHAIN_BIN/aarch64-linux-android${ANDROID_API}-clang"
+            else
+              echo "Unsupported ANDROID GOARCH=$GOARCH"
+              exit 1
+            fi
+
+            echo "Using Android NDK CC=$CC"
+          fi
+
+          mkdir -p dist
+
+          # Set extension for windows
+          if [ "${GOOS}" = "windows" ]; then
+            EXT=.exe
+          else
+            EXT=
+          fi
+
+          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
+          go build -ldflags "-s -w -checklinkname=0" -trimpath \
+            -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
+            ./client
+          
+          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
+          go build -ldflags "-s -w -checklinkname=0" -trimpath \
+            -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
+            ./server
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: good-turn-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/**
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # upload every file in dist/ including nested files
+          files: |
+            dist/**
+          # make the release name/tag the pushed tag
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
