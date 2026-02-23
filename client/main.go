@@ -612,7 +612,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	ctx1, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if turnParams.udp {
-		conn, err2 := net.DialUDP("udp", nil, turnServerUdpAddr) // nolint: noctx
+		conn, err2 := net.DialUDP("udp4", nil, turnServerUdpAddr) // nolint: noctx
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -625,7 +625,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = &connectedUDPConn{conn}
 	} else {
-		conn, err2 := d.DialContext(ctx1, "tcp", turnServerAddr) // nolint: noctx
+		conn, err2 := d.DialContext(ctx1, "tcp4", turnServerAddr) // nolint: noctx
 		if err2 != nil {
 			err = fmt.Errorf("failed to connect to TURN server: %s", err2)
 			return
@@ -638,22 +638,15 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}()
 		turnConn = turn.NewSTUNConn(conn)
 	}
-	var addrFamily turn.RequestedAddressFamily
-	if peer.IP.To4() != nil {
-		addrFamily = turn.RequestedAddressFamilyIPv4
-	} else {
-		addrFamily = turn.RequestedAddressFamilyIPv6
-	}
 	// Start a new TURN Client and wrap our net.Conn in a STUNConn
 	// This allows us to simulate datagram based communication over a net.Conn
 	cfg = &turn.ClientConfig{
-		STUNServerAddr:         turnServerAddr,
-		TURNServerAddr:         turnServerAddr,
-		Conn:                   turnConn,
-		Username:               user,
-		Password:               pass,
-		RequestedAddressFamily: addrFamily,
-		LoggerFactory:          logging.NewDefaultLoggerFactory(),
+		STUNServerAddr: turnServerAddr,
+		TURNServerAddr: turnServerAddr,
+		Conn:           turnConn,
+		Username:       user,
+		Password:       pass,
+		LoggerFactory:  logging.NewDefaultLoggerFactory(),
 	}
 
 	client, err1 := turn.NewClient(cfg)
