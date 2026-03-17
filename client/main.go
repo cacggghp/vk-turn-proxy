@@ -943,4 +943,3 @@ func main() { //nolint:cyclop
 
 	wg1.Wait()
 }
-
