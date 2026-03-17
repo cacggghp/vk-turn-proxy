@@ -28,9 +28,8 @@ You will need:
 #### Android
 
 **Recommended method:**
-Use the native Android app [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android).
-- In the WireGuard client config, change the server address to `127.0.0.1:9000` and set MTU to 1280.
-- **Add the app to WireGuard exceptions (Excluded Applications). Click "Save".**
+Use the native Android app [wireguard-turn-android](https://github.com/kiper292/wireguard-turn-android).
+- The app has a built-in proxy and configures the tunnel automatically.
 
 **Alternative method (via Termux):**
 - In the WireGuard client config, change the server address to `127.0.0.1:9000` and set MTU to 1280.
