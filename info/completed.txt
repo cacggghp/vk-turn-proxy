@@ -1,0 +1,32 @@
+# Multi-User DTLS Proxy Roadmap - STATUS: COMPLETED
+
+## Completed Tasks
+1. **Phase 1: Protocol Definition**
+   - Defined 16-byte UUID handshake immediately following DTLS handshake.
+   - Verified that both client and server respect this sequence.
+
+2. **Phase 2: Server Refactoring**
+   - Implemented `SessionManager` to track user sessions by UUID.
+   - Implemented `UserSession` to aggregate multiple DTLS streams.
+   - Switched to a single `BackendConn` (UDP) per session to prevent WireGuard endpoint thrashing.
+   - Added round-robin distribution of downstream traffic across available DTLS streams.
+   - Implemented thread-safe connection management and cleanup.
+
+3. **Phase 3: Client Refactoring**
+   - Added automatic UUID generation at startup.
+   - Added `-session-id` flag to allow manual session overrides.
+   - Updated `oneDtlsConnection` to transmit the session ID immediately after handshake.
+
+4. **Phase 4: Robustness**
+   - Added proper context handling and timeouts for handshakes and data transfer.
+   - Implemented cleanup logic to remove sessions from memory when the backend connection fails.
+
+## Benefits of New Implementation
+- **Stable Peer Endpoints:** WireGuard server now sees a single, stable source port for each client regardless of how many DTLS streams are used.
+- **Improved Multiplexing:** Traffic is balanced across all active DTLS streams.
+- **Multi-user Support:** Multiple distinct clients can now connect to the same proxy server simultaneously.
+
+## Future Improvements (Optional)
+- **Session Persistence:** Save session IDs to a file on the client side to survive restarts.
+- **Dynamic Stream Count:** Allow the client to adjust the number of streams based on network conditions.
+- **Inactivity Timeout:** Explicitly close sessions if no data is received from either side for a prolonged period.
