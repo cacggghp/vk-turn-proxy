@@ -77,7 +77,7 @@ func getVkCreds(link string) (string, string, string, error) {
 			log.Panicf("get TURN creds error: %v\n\n", resp)
 		}
 	}()
-
+/*
 	data := "client_secret=QbYic1K3lEV5kTGiqlq2&client_id=6287487&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous&isApiOauthAnonymEnabled=false&version=1&app_id=6287487"
 	url := "https://login.vk.ru/?act=get_anonym_token"
 
@@ -97,11 +97,12 @@ func getVkCreds(link string) (string, string, string, error) {
 	}
 
 	token2 := resp["response"].(map[string]interface{})["payload"].(string)
+*/
+	//data = fmt.Sprintf("client_id=6287487&token_type=messages&payload=%s&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487", token2)
+	data := fmt.Sprintf("client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487")
+	url := "https://login.vk.ru/?act=get_anonym_token"
 
-	data = fmt.Sprintf("client_id=6287487&token_type=messages&payload=%s&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487", token2)
-	url = "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err = doRequest(data, url)
+	resp, err := doRequest(data, url)
 	if err != nil {
 		return "", "", "", fmt.Errorf("request error:%s", err)
 	}
@@ -109,7 +110,7 @@ func getVkCreds(link string) (string, string, string, error) {
 	token3 := resp["data"].(map[string]interface{})["access_token"].(string)
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token3)
-	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.264"
+	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
@@ -128,7 +129,7 @@ func getVkCreds(link string) (string, string, string, error) {
 
 	token5 := resp["session_key"].(string)
 
-	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token4, token5)
+	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token4, token5)
 	url = "https://calls.okcdn.ru/fb.do"
 
 	resp, err = doRequest(data, url)
@@ -453,7 +454,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error, sessionID []byte, streamID byte) {
 	var err error = nil
 	defer func() { c <- err }()
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -481,7 +482,18 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 		}
 		log.Printf("Closed DTLS connection\n")
 	}()
-	log.Printf("Established DTLS connection!\n")
+
+	// Phase 1: Send Session ID + Stream ID (17 bytes)
+	dtlsConn.SetWriteDeadline(time.Now().Add(time.Second * 5))
+	idBuf := make([]byte, 17)
+	copy(idBuf[:16], sessionID)
+	idBuf[16] = streamID
+	if _, err1 = dtlsConn.Write(idBuf); err1 != nil {
+		err = fmt.Errorf("failed to send session ID: %s", err1)
+		return
+	}
+
+	log.Printf("Established DTLS connection and sent session ID with stream %d!\n", streamID)
 	go func() {
 		for {
 			select {
@@ -758,14 +770,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	conn2.SetDeadline(time.Time{})
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, sessionID []byte, streamID byte) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c, sessionID, streamID)
 			if err := <-c; err != nil {
 				log.Printf("%s", err)
 			}
@@ -817,6 +829,7 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
+	sessionIDFlag := flag.String("session-id", "", "override session ID (hex, 32 chars)")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -856,6 +869,17 @@ func main() { //nolint:cyclop
 		getCreds,
 	}
 
+	var sessionID []byte
+	if *sessionIDFlag != "" {
+		sessionID = make([]byte, 16)
+		if _, err := fmt.Sscanf(*sessionIDFlag, "%x", &sessionID); err != nil {
+			log.Panicf("Invalid session ID: %v", err)
+		}
+	} else {
+		sessionID, _ = uuid.New().MarshalBinary()
+	}
+	log.Printf("Session ID: %x", sessionID)
+
 	listenConnChan := make(chan net.PacketConn)
 	listenConn, err := net.ListenPacket("udp", *listen) // nolint: noctx
 	if err != nil {
@@ -880,21 +904,27 @@ func main() { //nolint:cyclop
 	t := time.Tick(100 * time.Millisecond)
 	if *direct {
 		for i := 0; i < *n; i++ {
-			wg1.Go(func() {
+			wg1.Add(1)
+			go func() {
+				defer wg1.Done()
 				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t)
-			})
+			}()
 		}
 	} else {
 		okchan := make(chan struct{})
 		connchan := make(chan net.PacketConn)
 
-		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan)
-		})
+		wg1.Add(1)
+		go func() {
+			defer wg1.Done()
+			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan, sessionID, 0)
+		}()
 
-		wg1.Go(func() {
+		wg1.Add(1)
+		go func() {
+			defer wg1.Done()
 			oneTurnConnectionLoop(ctx, params, peer, connchan, t)
-		})
+		}()
 
 		select {
 		case <-okchan:
@@ -902,12 +932,16 @@ func main() { //nolint:cyclop
 		}
 		for i := 0; i < *n-1; i++ {
 			connchan := make(chan net.PacketConn)
-			wg1.Go(func() {
-				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil)
-			})
-			wg1.Go(func() {
+			wg1.Add(1)
+			go func(streamID byte) {
+				defer wg1.Done()
+				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil, sessionID, streamID)
+			}(byte(i + 1))
+			wg1.Add(1)
+			go func() {
+				defer wg1.Done()
 				oneTurnConnectionLoop(ctx, params, peer, connchan, t)
-			})
+			}()
 		}
 	}
 
