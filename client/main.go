@@ -77,7 +77,7 @@ func getVkCreds(link string) (string, string, string, error) {
 			log.Panicf("get TURN creds error: %v\n\n", resp)
 		}
 	}()
-
+/*
 	data := "client_secret=QbYic1K3lEV5kTGiqlq2&client_id=6287487&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous&isApiOauthAnonymEnabled=false&version=1&app_id=6287487"
 	url := "https://login.vk.ru/?act=get_anonym_token"
 
@@ -97,11 +97,12 @@ func getVkCreds(link string) (string, string, string, error) {
 	}
 
 	token2 := resp["response"].(map[string]interface{})["payload"].(string)
+*/
+	//data = fmt.Sprintf("client_id=6287487&token_type=messages&payload=%s&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487", token2)
+	data := fmt.Sprintf("client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487")
+	url := "https://login.vk.ru/?act=get_anonym_token"
 
-	data = fmt.Sprintf("client_id=6287487&token_type=messages&payload=%s&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487", token2)
-	url = "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err = doRequest(data, url)
+	resp, err := doRequest(data, url)
 	if err != nil {
 		return "", "", "", fmt.Errorf("request error:%s", err)
 	}
@@ -109,7 +110,7 @@ func getVkCreds(link string) (string, string, string, error) {
 	token3 := resp["data"].(map[string]interface{})["access_token"].(string)
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token3)
-	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.264"
+	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
 	resp, err = doRequest(data, url)
 	if err != nil {
@@ -128,7 +129,7 @@ func getVkCreds(link string) (string, string, string, error) {
 
 	token5 := resp["session_key"].(string)
 
-	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token4, token5)
+	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token4, token5)
 	url = "https://calls.okcdn.ru/fb.do"
 
 	resp, err = doRequest(data, url)
