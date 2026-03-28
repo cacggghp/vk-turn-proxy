@@ -13,6 +13,19 @@
 ```
 ./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
 ```
+#### Docker
+Сборка образа:
+```
+docker build -t vk-turn-proxy .
+```
+
+Переменная окружения **CONNECT_ADDR** — адрес WireGuard (обязательный), например `192.168.1.10:51820`.
+
+Пример запуска:
+```
+docker run -p 56000:56000/udp -e CONNECT_ADDR=192.168.1.10:51820 vk-turn-proxy
+```
+
 ### Клиент
 #### Android
 
