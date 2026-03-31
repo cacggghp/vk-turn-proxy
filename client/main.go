@@ -821,25 +821,42 @@ func main() { //nolint:cyclop
 		log.Fatalf("Exit...\n")
 	}()
 
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: vk-turn-proxy-client [options]\n\n")
+		fmt.Fprintf(os.Stderr, "VK TURN Proxy client — connects to a TURN relay via a VK or Yandex invite link\n")
+		fmt.Fprintf(os.Stderr, "and tunnels UDP traffic to a remote peer (vk-turn-proxy-server).\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  # VK Calls:\n")
+		fmt.Fprintf(os.Stderr, "  vk-turn-proxy-client -peer 1.2.3.4:56000 -vk-link \"https://vk.com/call/join/ABC123\" -listen 127.0.0.1:9000\n\n")
+		fmt.Fprintf(os.Stderr, "  # Yandex Telemost:\n")
+		fmt.Fprintf(os.Stderr, "  vk-turn-proxy-client -peer 1.2.3.4:56000 -yandex-link \"https://telemost.yandex.ru/j/ABC123\" -listen 127.0.0.1:9000\n")
+	}
+
 	host := flag.String("turn", "", "override TURN server ip")
 	port := flag.String("port", "", "override TURN port")
 	listen := flag.String("listen", "127.0.0.1:9000", "listen on ip:port")
 	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
 	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
-	peerAddr := flag.String("peer", "", "peer server address (host:port)")
+	peerAddr := flag.String("peer", "", "peer server address (host:port) (required)")
 	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	flag.Parse()
 	if *peerAddr == "" {
-		log.Panicf("Need peer address!")
+		fmt.Fprintf(os.Stderr, "error: -peer is required\n\n")
+		flag.Usage()
+		os.Exit(1)
 	}
 	peer, err := net.ResolveUDPAddr("udp", *peerAddr)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to resolve peer address %q: %v", *peerAddr, err)
 	}
 	if (*vklink == "") == (*yalink == "") {
-		log.Panicf("Need either vk-link or yandex-link!")
+		fmt.Fprintf(os.Stderr, "error: exactly one of -vk-link or -yandex-link is required\n\n")
+		flag.Usage()
+		os.Exit(1)
 	}
 
 	var link string
@@ -882,11 +899,11 @@ func main() { //nolint:cyclop
 	listenConnChan := make(chan net.PacketConn)
 	listenConn, err := net.ListenPacket("udp", *listen) // nolint: noctx
 	if err != nil {
-		log.Panicf("Failed to listen: %s", err)
+		log.Fatalf("failed to listen on %s: %v", *listen, err)
 	}
 	context.AfterFunc(ctx, func() {
 		if closeErr := listenConn.Close(); closeErr != nil {
-			log.Panicf("Failed to close local connection: %s", closeErr)
+			log.Printf("failed to close local connection: %v", closeErr)
 		}
 	})
 	go func() {

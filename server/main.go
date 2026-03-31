@@ -18,9 +18,25 @@ import (
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: vk-turn-proxy-server [options]\n\n")
+		fmt.Fprintf(os.Stderr, "VK TURN Proxy server — accepts obfuscated DTLS connections and forwards\n")
+		fmt.Fprintf(os.Stderr, "them to a local WireGuard/UDP endpoint.\n\n")
+		fmt.Fprintf(os.Stderr, "Options:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExample:\n")
+		fmt.Fprintf(os.Stderr, "  vk-turn-proxy-server -listen 0.0.0.0:56000 -connect 127.0.0.1:51820\n")
+	}
+
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
-	connect := flag.String("connect", "", "connect to ip:port")
+	connect := flag.String("connect", "", "connect to ip:port (required)")
 	flag.Parse()
+
+	if *connect == "" {
+		fmt.Fprintf(os.Stderr, "error: -connect is required\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -36,15 +52,12 @@ func main() {
 
 	addr, err := net.ResolveUDPAddr("udp", *listen)
 	if err != nil {
-		panic(err)
-	}
-	if len(*connect) == 0 {
-		log.Panicf("server address is required")
+		log.Fatalf("failed to resolve listen address %q: %v", *listen, err)
 	}
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
-		panic(err)
+		log.Fatalf("failed to generate self-signed certificate: %v", genErr)
 	}
 
 	//
@@ -62,11 +75,11 @@ func main() {
 	// Connect to a DTLS server
 	listener, err := dtls.Listen("udp", addr, config)
 	if err != nil {
-		panic(err)
+		log.Fatalf("failed to start DTLS listener on %s: %v", addr, err)
 	}
 	context.AfterFunc(ctx, func() {
 		if err = listener.Close(); err != nil {
-			panic(err)
+			log.Printf("failed to close DTLS listener: %v", err)
 		}
 	})
 

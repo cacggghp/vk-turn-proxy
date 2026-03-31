@@ -1,0 +1,22 @@
+[Unit]
+Description=VK TURN Proxy Server
+After=network-online.target wireguard.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/default/vk-turn-proxy-server
+ExecStart=/usr/bin/vk-turn-proxy-server $OPTS
+Restart=on-failure
+RestartSec=5
+User=nobody
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=
+
+[Install]
+WantedBy=multi-user.target
