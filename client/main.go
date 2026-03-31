@@ -1,27 +1,11 @@
-// SPDX-FileCopyrightText: 2023 The Pion community <https://pion.ly>
-// SPDX-License-Identifier: MIT
-
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/bschaatsbergen/dnsdialer"
-	"github.com/cbeuw/connutil"
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
-	"github.com/pion/logging"
-	"github.com/pion/turn/v5"
-	"io"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,413 +13,24 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cbeuw/connutil"
+	piondtls "github.com/pion/dtls/v3"
+	"github.com/pion/logging"
+	"github.com/pion/turn/v5"
+
+	"github.com/cacggghp/vk-turn-proxy/internal/api/vk"
+	"github.com/cacggghp/vk-turn-proxy/internal/api/yandex"
+	"github.com/cacggghp/vk-turn-proxy/internal/dtls"
 )
 
-type getCredsFunc func(string) (string, string, string, error)
+type getCredsFunc func() (string, string, string, error)
 
-func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
-
-	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-				DialContext:         dialer.DialContext,
-			},
-		}
-		defer client.CloseIdleConnections()
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
-		if err != nil {
-			return nil, err
-		}
-
-		req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0")
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-		httpResp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer func() {
-			if closeErr := httpResp.Body.Close(); closeErr != nil {
-				log.Printf("close response body: %s", closeErr)
-			}
-		}()
-
-		body, err := io.ReadAll(httpResp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		err = json.Unmarshal(body, &resp)
-		if err != nil {
-			return nil, err
-		}
-
-		return resp, nil
-	}
-
-	var resp map[string]interface{}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Panicf("get TURN creds error: %v\n\n", resp)
-		}
-	}()
-
-	data := "client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487"
-	url := "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err := doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
-
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token1)
-	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token2 := resp["response"].(map[string]interface{})["token"].(string)
-
-	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
-	url = "https://calls.okcdn.ru/fb.do"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token3 := resp["session_key"].(string)
-
-	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token2, token3)
-	url = "https://calls.okcdn.ru/fb.do"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	user := resp["turn_server"].(map[string]interface{})["username"].(string)
-	pass := resp["turn_server"].(map[string]interface{})["credential"].(string)
-	turn := resp["turn_server"].(map[string]interface{})["urls"].([]interface{})[0].(string)
-
-	clean := strings.Split(turn, "?")[0]
-	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-
-	return user, pass, address, nil
-}
-
-func getYandexCreds(link string) (string, string, string, error) {
-	const debug = false
-	const telemostConfHost = "cloud-api.yandex.ru"
-	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
-	const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
-
-	type ConferenceResponse struct {
-		URI                 string `json:"uri"`
-		RoomID              string `json:"room_id"`
-		PeerID              string `json:"peer_id"`
-		ClientConfiguration struct {
-			MediaServerURL string `json:"media_server_url"`
-		} `json:"client_configuration"`
-		Credentials string `json:"credentials"`
-	}
-
-	type PartMeta struct {
-		Name        string `json:"name"`
-		Role        string `json:"role"`
-		Description string `json:"description"`
-		SendAudio   bool   `json:"sendAudio"`
-		SendVideo   bool   `json:"sendVideo"`
-	}
-
-	type PartAttrs struct {
-		Name        string `json:"name"`
-		Role        string `json:"role"`
-		Description string `json:"description"`
-	}
-
-	type SdkInfo struct {
-		Implementation string `json:"implementation"`
-		Version        string `json:"version"`
-		UserAgent      string `json:"userAgent"`
-		HwConcurrency  int    `json:"hwConcurrency"`
-	}
-
-	type Capabilities struct {
-		OfferAnswerMode             []string `json:"offerAnswerMode"`
-		InitialSubscriberOffer      []string `json:"initialSubscriberOffer"`
-		SlotsMode                   []string `json:"slotsMode"`
-		SimulcastMode               []string `json:"simulcastMode"`
-		SelfVadStatus               []string `json:"selfVadStatus"`
-		DataChannelSharing          []string `json:"dataChannelSharing"`
-		VideoEncoderConfig          []string `json:"videoEncoderConfig"`
-		DataChannelVideoCodec       []string `json:"dataChannelVideoCodec"`
-		BandwidthLimitationReason   []string `json:"bandwidthLimitationReason"`
-		SdkDefaultDeviceManagement  []string `json:"sdkDefaultDeviceManagement"`
-		JoinOrderLayout             []string `json:"joinOrderLayout"`
-		PinLayout                   []string `json:"pinLayout"`
-		SendSelfViewVideoSlot       []string `json:"sendSelfViewVideoSlot"`
-		ServerLayoutTransition      []string `json:"serverLayoutTransition"`
-		SdkPublisherOptimizeBitrate []string `json:"sdkPublisherOptimizeBitrate"`
-		SdkNetworkLostDetection     []string `json:"sdkNetworkLostDetection"`
-		SdkNetworkPathMonitor       []string `json:"sdkNetworkPathMonitor"`
-		PublisherVp9                []string `json:"publisherVp9"`
-		SvcMode                     []string `json:"svcMode"`
-		SubscriberOfferAsyncAck     []string `json:"subscriberOfferAsyncAck"`
-		SvcModes                    []string `json:"svcModes"`
-		ReportTelemetryModes        []string `json:"reportTelemetryModes"`
-		KeepDefaultDevicesModes     []string `json:"keepDefaultDevicesModes"`
-	}
-
-	type HelloPayload struct {
-		ParticipantMeta        PartMeta     `json:"participantMeta"`
-		ParticipantAttributes  PartAttrs    `json:"participantAttributes"`
-		SendAudio              bool         `json:"sendAudio"`
-		SendVideo              bool         `json:"sendVideo"`
-		SendSharing            bool         `json:"sendSharing"`
-		ParticipantID          string       `json:"participantId"`
-		RoomID                 string       `json:"roomId"`
-		ServiceName            string       `json:"serviceName"`
-		Credentials            string       `json:"credentials"`
-		CapabilitiesOffer      Capabilities `json:"capabilitiesOffer"`
-		SdkInfo                SdkInfo      `json:"sdkInfo"`
-		SdkInitializationID    string       `json:"sdkInitializationId"`
-		DisablePublisher       bool         `json:"disablePublisher"`
-		DisableSubscriber      bool         `json:"disableSubscriber"`
-		DisableSubscriberAudio bool         `json:"disableSubscriberAudio"`
-	}
-
-	type HelloRequest struct {
-		UID   string       `json:"uid"`
-		Hello HelloPayload `json:"hello"`
-	}
-
-	type FlexUrls []string
-
-	type WSSResponse struct {
-		UID         string `json:"uid"`
-		ServerHello struct {
-			RtcConfiguration struct {
-				IceServers []struct {
-					Urls       FlexUrls `json:"urls"`
-					Username   string   `json:"username,omitempty"`
-					Credential string   `json:"credential,omitempty"`
-				} `json:"iceServers"`
-			} `json:"rtcConfiguration"`
-		} `json:"serverHello"`
-	}
-
-	type WSSAck struct {
-		Uid string `json:"uid"`
-		Ack struct {
-			Status struct {
-				Code string `json:"code"`
-			} `json:"status"`
-		} `json:"ack"`
-	}
-
-	type WSSData struct {
-		ParticipantId string
-		RoomId        string
-		Credentials   string
-		Wss           string
-	}
-
-	endpoint := "https://" + telemostConfHost + telemostConfPath
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-		},
-	}
-	defer client.CloseIdleConnections()
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return "", "", "", err
-	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Referer", "https://telemost.yandex.ru/")
-	req.Header.Set("Origin", "https://telemost.yandex.ru")
-	req.Header.Set("Client-Instance-Id", uuid.New().String())
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", err
-	}
-	defer func() {
-		if closeErr := resp.Body.Close(); closeErr != nil {
-			log.Printf("close response body: %s", closeErr)
-		}
-	}()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return "", "", "", fmt.Errorf("GetConference: status=%s body=%s", resp.Status, string(body))
-	}
-
-	var result ConferenceResponse
-	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", "", "", fmt.Errorf("decode conf: %v", err)
-	}
-	data := WSSData{
-		ParticipantId: result.PeerID,
-		RoomId:        result.RoomID,
-		Credentials:   result.Credentials,
-		Wss:           result.ClientConfiguration.MediaServerURL,
-	}
-	h := http.Header{}
-	h.Set("Origin", "https://telemost.yandex.ru")
-	h.Set("User-Agent", userAgent)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	dialer := websocket.Dialer{}
-	conn, _, err := dialer.DialContext(ctx, data.Wss, h)
-	if err != nil {
-		return "", "", "", fmt.Errorf("ws dial: %w", err)
-	}
-	defer func() {
-		if closeErr := conn.Close(); closeErr != nil {
-			log.Printf("close websocket: %s", closeErr)
-		}
-	}()
-
-	req1 := HelloRequest{
-		UID: uuid.New().String(),
-		Hello: HelloPayload{
-			ParticipantMeta: PartMeta{
-				Name:        "Гость",
-				Role:        "SPEAKER",
-				Description: "",
-				SendAudio:   false,
-				SendVideo:   false,
-			},
-			ParticipantAttributes: PartAttrs{
-				Name:        "Гость",
-				Role:        "SPEAKER",
-				Description: "",
-			},
-			SendAudio:   false,
-			SendVideo:   false,
-			SendSharing: false,
-
-			ParticipantID: data.ParticipantId,
-			RoomID:        data.RoomId,
-			ServiceName:   "telemost",
-			Credentials:   data.Credentials,
-			SdkInfo: SdkInfo{
-				Implementation: "browser",
-				Version:        "5.15.0",
-				UserAgent:      userAgent,
-				HwConcurrency:  4,
-			},
-			SdkInitializationID:    uuid.New().String(),
-			DisablePublisher:       false,
-			DisableSubscriber:      false,
-			DisableSubscriberAudio: false,
-			CapabilitiesOffer: Capabilities{
-				OfferAnswerMode:             []string{"SEPARATE"},
-				InitialSubscriberOffer:      []string{"ON_HELLO"},
-				SlotsMode:                   []string{"FROM_CONTROLLER"},
-				SimulcastMode:               []string{"DISABLED"},
-				SelfVadStatus:               []string{"FROM_SERVER"},
-				DataChannelSharing:          []string{"TO_RTP"},
-				VideoEncoderConfig:          []string{"NO_CONFIG"},
-				DataChannelVideoCodec:       []string{"VP8"},
-				BandwidthLimitationReason:   []string{"BANDWIDTH_REASON_DISABLED"},
-				SdkDefaultDeviceManagement:  []string{"SDK_DEFAULT_DEVICE_MANAGEMENT_DISABLED"},
-				JoinOrderLayout:             []string{"JOIN_ORDER_LAYOUT_DISABLED"},
-				PinLayout:                   []string{"PIN_LAYOUT_DISABLED"},
-				SendSelfViewVideoSlot:       []string{"SEND_SELF_VIEW_VIDEO_SLOT_DISABLED"},
-				ServerLayoutTransition:      []string{"SERVER_LAYOUT_TRANSITION_DISABLED"},
-				SdkPublisherOptimizeBitrate: []string{"SDK_PUBLISHER_OPTIMIZE_BITRATE_DISABLED"},
-				SdkNetworkLostDetection:     []string{"SDK_NETWORK_LOST_DETECTION_DISABLED"},
-				SdkNetworkPathMonitor:       []string{"SDK_NETWORK_PATH_MONITOR_DISABLED"},
-				PublisherVp9:                []string{"PUBLISH_VP9_DISABLED"},
-				SvcMode:                     []string{"SVC_MODE_DISABLED"},
-				SubscriberOfferAsyncAck:     []string{"SUBSCRIBER_OFFER_ASYNC_ACK_DISABLED"},
-				SvcModes:                    []string{"FALSE"},
-				ReportTelemetryModes:        []string{"TRUE"},
-				KeepDefaultDevicesModes:     []string{"TRUE"},
-			},
-		},
-	}
-
-	if debug {
-		b, _ := json.MarshalIndent(req1, "", "  ")
-		log.Printf("Sending HELLO:\n%s", string(b))
-	}
-
-	if err := conn.WriteJSON(req1); err != nil {
-		return "", "", "", fmt.Errorf("ws write: %w", err)
-	}
-
-	if err := conn.SetReadDeadline(time.Now().Add(15 * time.Second)); err != nil {
-		return "", "", "", fmt.Errorf("ws set read deadline: %w", err)
-	}
-
-	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
-			return "", "", "", fmt.Errorf("ws read: %w", err)
-		}
-		if debug {
-			s := string(msg)
-			if len(s) > 800 {
-				s = s[:800] + "...(truncated)"
-			}
-			log.Printf("WSS recv: %s", s)
-		}
-
-		var ack WSSAck
-		if err := json.Unmarshal(msg, &ack); err == nil && ack.Ack.Status.Code != "" {
-			continue
-		}
-
-		var resp WSSResponse
-		if err := json.Unmarshal(msg, &resp); err == nil {
-			ice := resp.ServerHello.RtcConfiguration.IceServers
-			for _, s := range ice {
-				for _, u := range s.Urls {
-					if !strings.HasPrefix(u, "turn:") && !strings.HasPrefix(u, "turns:") {
-						continue
-					}
-					if strings.Contains(u, "transport=tcp") {
-						continue
-					}
-					clean := strings.Split(u, "?")[0]
-					address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-
-					return s.Username, s.Credential, address, nil
-				}
-			}
-		}
-	}
-}
-
-func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.Conn, error) {
-	certificate, err := selfsign.GenerateSelfSigned()
+func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr, secret string) (net.Conn, error) {
+	config, err := dtls.ClientConfig(secret)
 	if err != nil {
 		return nil, err
-	}
-	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		InsecureSkipVerify:    true,
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
 	}
 	ctx1, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -444,13 +39,13 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 		return nil, err
 	}
 
-	if err := dtlsConn.HandshakeContext(ctx1); err != nil {
+	if err := dtlsConn.(*piondtls.Conn).HandshakeContext(ctx1); err != nil {
 		return nil, err
 	}
 	return dtlsConn, nil
 }
 
-func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error) {
+func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, c chan<- error, secret string) {
 	var err error = nil
 	defer func() { c <- err }()
 	dtlsctx, dtlscancel := context.WithCancel(ctx)
@@ -466,7 +61,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 			}
 		}
 	}()
-	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer)
+	dtlsConn, err1 := dtlsFunc(dtlsctx, conn1, peer, secret)
 	if err1 != nil {
 		err = fmt.Errorf("failed to connect DTLS: %s", err1)
 		return
@@ -577,7 +172,6 @@ func (c *connectedUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
 type turnParams struct {
 	host     string
 	port     string
-	link     string
 	udp      bool
 	getCreds getCredsFunc
 }
@@ -585,7 +179,7 @@ type turnParams struct {
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
-	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
+	user, pass, url, err1 := turnParams.getCreds()
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
@@ -609,7 +203,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		return
 	}
 	turnServerAddr = turnServerUdpAddr.String()
-	fmt.Println(turnServerUdpAddr.IP)
+
 	// Dial TURN Server
 	var cfg *turn.ClientConfig
 	var turnConn net.PacketConn
@@ -649,8 +243,6 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	} else {
 		addrFamily = turn.RequestedAddressFamilyIPv6
 	}
-	// Start a new TURN Client and wrap our net.Conn in a STUNConn
-	// This allows us to simulate datagram based communication over a net.Conn
 	cfg = &turn.ClientConfig{
 		STUNServerAddr:         turnServerAddr,
 		TURNServerAddr:         turnServerAddr,
@@ -668,19 +260,15 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 	defer client.Close()
 
-	// Start listening on the conn provided.
 	err1 = client.Listen()
 	if err1 != nil {
 		err = fmt.Errorf("failed to listen: %s", err1)
 		return
 	}
 
-	// Allocate a relay socket on the TURN server. On success, it
-	// will return a net.PacketConn which represents the remote
-	// socket.
 	relayConn, err1 := client.Allocate()
 	if err1 != nil {
-		err = fmt.Errorf("failed to allocate: %s", err1)
+		err = fmt.Errorf("failed to allocate relay: %s", err1)
 		return
 	}
 	defer func() {
@@ -689,9 +277,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 		}
 	}()
 
-	// The relayConn's local address is actually the transport
-	// address assigned on the TURN server.
-	log.Printf("relayed-address=%s", relayConn.LocalAddr().String())
+	log.Printf("Relayed address: %s", relayConn.LocalAddr().String())
 
 	wg := sync.WaitGroup{}
 	wg.Add(2)
@@ -718,7 +304,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			}
 			n, addr1, err1 := conn2.ReadFrom(buf)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				log.Printf("conn2 read failed: %s", err1)
 				return
 			}
 
@@ -726,7 +312,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			_, err1 = relayConn.WriteTo(buf[:n], peer)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				log.Printf("relay write failed: %s", err1)
 				return
 			}
 		}
@@ -745,18 +331,18 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			}
 			n, _, err1 := relayConn.ReadFrom(buf)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				log.Printf("relay read failed: %s", err1)
 				return
 			}
 			addr1, ok := addr.Load().(net.Addr)
 			if !ok {
-				log.Printf("Failed: no listener ip")
+				log.Printf("failed: no listener ip")
 				return
 			}
 
 			_, err1 = conn2.WriteTo(buf[:n], addr1)
 			if err1 != nil {
-				log.Printf("Failed: %s", err1)
+				log.Printf("conn2 write failed: %s", err1)
 				return
 			}
 		}
@@ -771,14 +357,14 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 }
 
-func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}) {
+func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnChan <-chan net.PacketConn, connchan chan<- net.PacketConn, okchan chan<- struct{}, secret string) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case listenConn := <-listenConnChan:
 			c := make(chan error)
-			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c)
+			go oneDtlsConnection(ctx, peer, listenConn, connchan, okchan, c, secret)
 			if err := <-c; err != nil {
 				log.Printf("%s", err)
 			}
@@ -843,7 +429,9 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
+	secret := flag.String("secret", "", "optional PSK (Pre-Shared Key) for DTLS authentication")
 	flag.Parse()
+
 	if *peerAddr == "" {
 		fmt.Fprintf(os.Stderr, "error: -peer is required\n\n")
 		flag.Usage()
@@ -861,9 +449,13 @@ func main() { //nolint:cyclop
 
 	var link string
 	var getCreds getCredsFunc
+
 	if *vklink != "" {
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
+		if idx := strings.IndexAny(link, "/?#"); idx != -1 {
+			link = link[:idx]
+		}
 
 		dialer := dnsdialer.New(
 			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53"),
@@ -871,8 +463,8 @@ func main() { //nolint:cyclop
 			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
 		)
 
-		getCreds = func(s string) (string, string, string, error) {
-			return getVkCreds(s, dialer)
+		getCreds = func() (string, string, string, error) {
+			return vk.GetCreds(link, dialer)
 		}
 		if *n <= 0 {
 			*n = 16
@@ -880,20 +472,23 @@ func main() { //nolint:cyclop
 	} else {
 		parts := strings.Split(*yalink, "j/")
 		link = parts[len(parts)-1]
-		getCreds = getYandexCreds
+		if idx := strings.IndexAny(link, "/?#"); idx != -1 {
+			link = link[:idx]
+		}
+		
+		getCreds = func() (string, string, string, error) {
+			return yandex.GetCreds(link)
+		}
 		if *n <= 0 {
 			*n = 1
 		}
 	}
-	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
-		link = link[:idx]
-	}
+
 	params := &turnParams{
-		*host,
-		*port,
-		link,
-		*udp,
-		getCreds,
+		host:     *host,
+		port:     *port,
+		udp:      *udp,
+		getCreds: getCreds,
 	}
 
 	listenConnChan := make(chan net.PacketConn)
@@ -918,6 +513,7 @@ func main() { //nolint:cyclop
 
 	wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
+
 	if *direct {
 		for i := 0; i < *n; i++ {
 			wg1.Go(func() {
@@ -929,7 +525,7 @@ func main() { //nolint:cyclop
 		connchan := make(chan net.PacketConn)
 
 		wg1.Go(func() {
-			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan)
+			oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, okchan, *secret)
 		})
 
 		wg1.Go(func() {
@@ -943,7 +539,7 @@ func main() { //nolint:cyclop
 		for i := 0; i < *n-1; i++ {
 			connchan := make(chan net.PacketConn)
 			wg1.Go(func() {
-				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil)
+				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil, *secret)
 			})
 			wg1.Go(func() {
 				oneTurnConnectionLoop(ctx, params, peer, connchan, t)

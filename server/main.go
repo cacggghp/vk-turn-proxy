@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
@@ -13,8 +12,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	piondtls "github.com/pion/dtls/v3"
+	
+	"github.com/cacggghp/vk-turn-proxy/internal/dtls"
 )
 
 func main() {
@@ -30,6 +30,7 @@ func main() {
 
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port (required)")
+	secret := flag.String("secret", "", "optional PSK (Pre-Shared Key) for DTLS authentication")
 	flag.Parse()
 
 	if *connect == "" {
@@ -54,22 +55,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to resolve listen address %q: %v", *listen, err)
 	}
-	// Generate a certificate and private key to secure the connection
-	certificate, genErr := selfsign.GenerateSelfSigned()
-	if genErr != nil {
-		log.Fatalf("failed to generate self-signed certificate: %v", genErr)
-	}
 
-	//
-	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
-	//
-
-	// Prepare the configuration of the DTLS connection
-	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
+	// Prepare the configuration of the DTLS connection using internal package
+	config, err := dtls.ServerConfig(*secret)
+	if err != nil {
+		log.Fatalf("failed to configure DTLS server: %v", err)
 	}
 
 	// Connect to a DTLS server
@@ -83,7 +73,11 @@ func main() {
 		}
 	})
 
-	fmt.Println("Listening")
+	if *secret != "" {
+		fmt.Println("Listening with PSK authentication")
+	} else {
+		fmt.Println("Listening with self-signed certificate")
+	}
 
 	wg1 := sync.WaitGroup{}
 	for {
@@ -109,21 +103,18 @@ func main() {
 			}()
 			var err error = nil
 			log.Printf("Connection from %s\n", conn.RemoteAddr())
-			// `conn` is of type `net.Conn` but may be casted to `dtls.Conn`
-			// using `dtlsConn := conn.(*dtls.Conn)` in order to to expose
-			// functions like `ConnectionState` etc.
 
 			// Perform the handshake with a 30-second timeout
 			ctx1, cancel1 := context.WithTimeout(ctx, 30*time.Second)
-			dtlsConn, ok := conn.(*dtls.Conn)
+			dtlsConn, ok := conn.(*piondtls.Conn)
 			if !ok {
-				log.Println("Type error")
+				log.Println("Type error: expected dtls.Conn")
 				cancel1()
 				return
 			}
 			log.Println("Start handshake")
 			if err = dtlsConn.HandshakeContext(ctx1); err != nil {
-				log.Println(err)
+				log.Println("Handshake failed:", err)
 				cancel1()
 				return
 			}
