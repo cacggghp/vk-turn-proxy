@@ -23,7 +23,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -77,7 +79,9 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 		}
 	}()
 
-	fmt.Println("CAPTCHA_REQUIRED:http://127.0.0.1:8765")
+	captchaURL := "http://127.0.0.1:8765"
+	fmt.Println("CAPTCHA_REQUIRED:" + captchaURL)
+	openBrowser(captchaURL)
 
 	key := <-keyCh
 
@@ -86,6 +90,18 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 	srv.Shutdown(ctx)
 
 	return key, nil
+}
+
+func openBrowser(url string) {
+	switch runtime.GOOS {
+	case "windows":
+		exec.Command("cmd", "/c", "start", url).Start()
+	case "darwin":
+		exec.Command("open", url).Start()
+	case "linux":
+		exec.Command("xdg-open", url).Start()
+	// android — APK handles CAPTCHA_REQUIRED: via stdout
+	}
 }
 
 func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
