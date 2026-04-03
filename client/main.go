@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -14,8 +15,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
+	neturl "net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +40,276 @@ import (
 )
 
 type getCredsFunc func(string) (string, string, string, error)
+
+func solveCaptchaViaHTTP(captchaImg string) (string, error) {
+	keyCh := make(chan string, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;text-align:center;padding:20px}
+img{max-width:100%%;margin:16px 0}
+input{font-size:24px;padding:12px;width:80%%;box-sizing:border-box}
+button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
+</head><body>
+<h2>Введите капчу</h2>
+<img src="%s" alt="captcha"/>
+<form onsubmit="fetch('/solve?key='+encodeURIComponent(document.getElementById('k').value)).then(()=>{document.body.innerHTML='<h2>Готово</h2>';setTimeout(function(){window.close();}, 300);});return false;">
+<br><input id="k" type="text" autofocus placeholder="Текст с картинки"/>
+<br><button type="submit">Отправить</button>
+</form></body></html>`, captchaImg)
+	})
+	mux.HandleFunc("/solve", func(w http.ResponseWriter, r *http.Request) {
+		key := r.URL.Query().Get("key")
+		if key != "" {
+			select {
+			case keyCh <- key:
+			default:
+			}
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, `<!DOCTYPE html><html><body><h2>Готово</h2></body></html>`)
+	})
+
+	srv := &http.Server{
+		Addr:    "127.0.0.1:8765",
+		Handler: mux,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("captcha HTTP server error: %s", err)
+		}
+	}()
+
+	captchaURL := "http://127.0.0.1:8765"
+	fmt.Println("CAPTCHA_REQUIRED: " + captchaURL)
+	openBrowser(captchaURL)
+
+	key := <-keyCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+
+	return key, nil
+}
+
+func solveCaptchaViaProxy(redirectURI string) (string, error) {
+	keyCh := make(chan string, 1)
+
+	targetURL, err := neturl.Parse(redirectURI)
+	if err != nil {
+		return "", fmt.Errorf("invalid redirect URI: %v", err)
+	}
+
+	proxy := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = targetURL.Scheme
+			req.URL.Host = targetURL.Host
+			if req.URL.Path == "/" || req.URL.Path == "" {
+				req.URL.Path = targetURL.Path
+				req.URL.RawQuery = targetURL.RawQuery
+			}
+			req.Host = targetURL.Host
+		},
+		ModifyResponse: func(res *http.Response) error {
+			if res.StatusCode >= 300 && res.StatusCode < 400 && res.Header.Get("Location") != "" {
+				loc := res.Header.Get("Location")
+				if strings.HasPrefix(loc, "/") {
+					res.Header.Set("Location", loc)
+				} else if strings.HasPrefix(loc, targetURL.Scheme+"://"+targetURL.Host) {
+					res.Header.Set("Location", strings.Replace(loc, targetURL.Scheme+"://"+targetURL.Host, "http://127.0.0.1:8765", 1))
+				}
+			}
+
+			contentType := res.Header.Get("Content-Type")
+			if strings.Contains(contentType, "text/html") {
+				var bodyBytes []byte
+				var err error
+
+				reader := res.Body
+				if res.Header.Get("Content-Encoding") == "gzip" {
+					gzReader, err := gzip.NewReader(res.Body)
+					if err == nil {
+						reader = gzReader
+						defer gzReader.Close()
+					}
+				}
+
+				bodyBytes, err = io.ReadAll(reader)
+				if err != nil {
+					return err
+				}
+				res.Body.Close()
+
+				html := string(bodyBytes)
+				script := `
+<script>
+(function() {
+    function rewriteUrl(urlStr) {
+        if (!urlStr || typeof urlStr !== 'string') return urlStr;
+        if (urlStr.indexOf('http://') === 0 || urlStr.indexOf('https://') === 0) {
+            return '/generic_proxy?proxy_url=' + encodeURIComponent(urlStr);
+        }
+        return urlStr;
+    }
+
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function() {
+        if (arguments[1] && typeof arguments[1] === 'string') {
+            this._origUrl = arguments[1];
+            arguments[1] = rewriteUrl(arguments[1]);
+        }
+        return origOpen.apply(this, arguments);
+    };
+    XMLHttpRequest.prototype.send = function() {
+        var xhr = this;
+        if (this._origUrl && this._origUrl.indexOf('captchaNotRobot.check') !== -1) {
+            xhr.addEventListener('load', function() {
+                try {
+                    var data = JSON.parse(xhr.responseText);
+                    if (data.response && data.response.success_token) {
+                        fetch('/local-captcha-result', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: 'token=' + encodeURIComponent(data.response.success_token)
+                        }).then(() => {
+                            document.body.innerHTML = '<h2 style="text-align:center;margin-top:20vh">Готово! Можете закрыть страницу.</h2>';
+                            setTimeout(() => { window.close(); }, 300);
+                        });
+                    }
+                } catch(e) {}
+            });
+        }
+        return origSend.apply(this, arguments);
+    };
+
+    var origFetch = window.fetch;
+    if (origFetch) {
+        window.fetch = function() {
+            var url = arguments[0];
+            var isObj = (typeof url === 'object' && url && url.url);
+            var urlStr = isObj ? url.url : url;
+            
+            var origUrlStr = urlStr;
+            if (typeof urlStr === 'string') {
+                urlStr = rewriteUrl(urlStr);
+                if (isObj) {
+                    // It's a Request object, we can't trivially rewrite it if it's already instantiated,
+                    // but VK rarely uses new Request()
+                    arguments[0] = urlStr;
+                } else {
+                    arguments[0] = urlStr;
+                }
+            }
+            
+            var p = origFetch.apply(this, arguments);
+            if (typeof origUrlStr === 'string' && origUrlStr.indexOf('captchaNotRobot.check') !== -1) {
+                p.then(function(response) {
+                    return response.clone().json();
+                }).then(function(data) {
+                    if (data.response && data.response.success_token) {
+                        fetch('/local-captcha-result', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                            body: 'token=' + encodeURIComponent(data.response.success_token)
+                        }).then(() => {
+                            document.body.innerHTML = '<h2 style="text-align:center;margin-top:20vh">Готово! Можете закрыть страницу.</h2>';
+                            setTimeout(() => { window.close(); }, 300);
+                        });
+                    }
+                }).catch(function(e) {});
+            }
+            return p;
+        };
+    }
+})();
+</script>
+`
+				html = strings.Replace(html, "</head>", script+"</head>", 1)
+				res.Body = io.NopCloser(strings.NewReader(html))
+				res.ContentLength = int64(len(html))
+				res.Header.Set("Content-Length", fmt.Sprint(len(html)))
+				res.Header.Del("Content-Encoding")
+			}
+			return nil
+		},
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/local-captcha-result", func(w http.ResponseWriter, r *http.Request) {
+		r.ParseForm()
+		token := r.FormValue("token")
+		if token != "" {
+			select {
+			case keyCh <- token:
+			default:
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		fmt.Fprint(w, "ok")
+	})
+	mux.HandleFunc("/generic_proxy", func(w http.ResponseWriter, r *http.Request) {
+		targetAuthUrl := r.URL.Query().Get("proxy_url")
+		targetParsed, err := neturl.Parse(targetAuthUrl)
+		if err != nil || targetParsed.Host == "" {
+			http.Error(w, "Bad URL", 400)
+			return
+		}
+		genericReverse := &httputil.ReverseProxy{
+			Director: func(req *http.Request) {
+				req.URL.Scheme = targetParsed.Scheme
+				req.URL.Host = targetParsed.Host
+				req.URL.Path = targetParsed.Path
+				req.URL.RawQuery = targetParsed.RawQuery
+				req.Host = targetParsed.Host
+			},
+		}
+		genericReverse.ServeHTTP(w, r)
+	})
+	mux.Handle("/", proxy)
+
+	srv := &http.Server{
+		Addr:    "127.0.0.1:8765",
+		Handler: mux,
+	}
+
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("proxy HTTP server error: %s", err)
+		}
+	}()
+
+	captchaURL := "http://127.0.0.1:8765/"
+	fmt.Println("CAPTCHA_REQUIRED: " + captchaURL)
+	openBrowser(captchaURL)
+
+	key := <-keyCh
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+
+	return key, nil
+}
+
+
+func openBrowser(url string) {
+	switch runtime.GOOS {
+	case "windows":
+		exec.Command("cmd", "/c", "start", url).Start()
+	case "darwin":
+		exec.Command("open", url).Start()
+	case "linux":
+		exec.Command("xdg-open", url).Start()
+	// android — APK handles CAPTCHA_REQUIRED: via stdout
+	}
+}
 
 func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, error) {
 
@@ -96,17 +371,86 @@ func getVkCreds(link string, dialer *dnsdialer.Dialer) (string, string, string, 
 		return "", "", "", fmt.Errorf("request error:%s", err)
 	}
 
-	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
+	dataMap, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("unexpected anon token response: %v", resp)
+	}
+	token1, ok := dataMap["access_token"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("missing access_token in response: %v", resp)
+	}
 
 	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token1)
 	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
 
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
+	var token2 string
+	const maxCaptchaAttempts = 3
+	for attempt := 0; attempt <= maxCaptchaAttempts; attempt++ {
+		resp, err = doRequest(data, url)
+		if err != nil {
+			return "", "", "", fmt.Errorf("request error:%s", err)
+		}
 
-	token2 := resp["response"].(map[string]interface{})["token"].(string)
+		// Check for captcha error
+		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
+			errCode, _ := errObj["error_code"].(float64)
+			if errCode == 14 {
+				if attempt == maxCaptchaAttempts {
+					return "", "", "", fmt.Errorf("captcha failed after %d attempts", maxCaptchaAttempts)
+				}
+
+				captchaSid, _ := errObj["captcha_sid"].(string)
+				if captchaSid == "" {
+					// captcha_sid may be a number
+					if sidNum, ok := errObj["captcha_sid"].(float64); ok {
+						captchaSid = fmt.Sprintf("%.0f", sidNum)
+					}
+				}
+				captchaImg, _ := errObj["captcha_img"].(string)
+				redirectURI, _ := errObj["redirect_uri"].(string)
+
+				log.Printf("Captcha required (attempt %d/%d), sid=%s", attempt+1, maxCaptchaAttempts, captchaSid)
+
+				var solveErr error
+				var successToken string
+				var captchaKey string
+
+				if redirectURI != "" {
+					successToken, solveErr = solveCaptchaViaProxy(redirectURI)
+					if solveErr != nil {
+						return "", "", "", fmt.Errorf("proxy captcha solve error: %s", solveErr)
+					}
+					captchaTs, _ := errObj["captcha_ts"].(float64)
+					captchaAttempt, _ := errObj["captcha_attempt"].(float64)
+					if captchaAttempt == 0 {
+						captchaAttempt = 1
+					}
+
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%.3f&captcha_attempt=%d",
+						link, token1, captchaSid, neturl.QueryEscape(successToken), captchaTs, int(captchaAttempt))
+				} else {
+					captchaKey, solveErr = solveCaptchaViaHTTP(captchaImg)
+					if solveErr != nil {
+						return "", "", "", fmt.Errorf("captcha solve error: %s", solveErr)
+					}
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_sid=%s&captcha_key=%s",
+						link, token1, captchaSid, captchaKey)
+				}
+				continue
+			}
+			return "", "", "", fmt.Errorf("VK API error: %v", errObj)
+		}
+
+		respMap, ok := resp["response"].(map[string]interface{})
+		if !ok {
+			return "", "", "", fmt.Errorf("unexpected getAnonymousToken response: %v", resp)
+		}
+		token2, ok = respMap["token"].(string)
+		if !ok {
+			return "", "", "", fmt.Errorf("missing token in response: %v", resp)
+		}
+		break
+	}
 
 	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
 	url = "https://calls.okcdn.ru/fb.do"
@@ -808,6 +1152,25 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 	}
 }
 
+func cachedCreds(f getCredsFunc) getCredsFunc {
+	var mu sync.Mutex
+	var cUser, cPass, cAddr string
+	var cTime time.Time
+	return func(link string) (string, string, string, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !cTime.IsZero() && time.Since(cTime) < 10*time.Minute {
+			return cUser, cPass, cAddr, nil
+		}
+		u, p, a, err := f(link)
+		if err == nil {
+			cUser, cPass, cAddr = u, p, a
+			cTime = time.Now()
+		}
+		return u, p, a, err
+	}
+}
+
 func main() { //nolint:cyclop
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -830,7 +1193,7 @@ func main() { //nolint:cyclop
 	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
 	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
 	peerAddr := flag.String("peer", "", "peer server address (host:port)")
-	n := flag.Int("n", 0, "connections to TURN (default 16 for VK, 1 for Yandex)")
+	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
 	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
@@ -862,7 +1225,7 @@ func main() { //nolint:cyclop
 			return getVkCreds(s, dialer)
 		}
 		if *n <= 0 {
-			*n = 16
+			*n = 10
 		}
 	} else {
 		parts := strings.Split(*yalink, "j/")
@@ -880,7 +1243,7 @@ func main() { //nolint:cyclop
 		*port,
 		link,
 		*udp,
-		getCreds,
+		cachedCreds(getCreds),
 	}
 
 	if *tcpMode {
