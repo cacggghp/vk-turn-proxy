@@ -12,8 +12,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -31,123 +33,378 @@ import (
 	"github.com/pion/turn/v5"
 )
 
-type getCredsFunc func(string) (string, string, string, error)
+type getCredsFunc func(context.Context, string, int) (string, string, string, error)
 
-func getVkCreds(link string) (string, string, string, error) {
-	doRequest := func(data string, url string) (resp map[string]interface{}, err error) {
-		client := &http.Client{
-			Timeout: 20 * time.Second,
-			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 100,
-				IdleConnTimeout:     90 * time.Second,
-			},
+const vkClientID = "6287487"
+const vkClientSecret = "QbYic1K3lEV5kTGiqlq2"
+const vkAPIVersion = "5.275"
+
+// TurnCredentials stores cached TURN credentials
+type TurnCredentials struct {
+	Username   string
+	Password   string
+	ServerAddr string
+	ExpiresAt  time.Time
+	Link       string
+}
+
+// StreamCredentialsCache holds credentials cache for a single stream
+type StreamCredentialsCache struct {
+	creds         TurnCredentials
+	mutex         sync.RWMutex
+	errorCount    atomic.Int32
+	lastErrorTime atomic.Int64
+}
+
+const (
+	credentialLifetime = 10 * time.Minute
+	cacheSafetyMargin  = 60 * time.Second
+	maxCacheErrors     = 3
+	errorWindow        = 10 * time.Second
+	streamsPerCache    = 4 // Number of streams sharing one credentials cache
+)
+
+// getCacheID returns the shared cache ID for a given stream ID
+func getCacheID(streamID int) int {
+	return streamID / streamsPerCache
+}
+
+// credentialsStore manages per-stream credentials caches
+var credentialsStore = struct {
+	mu     sync.RWMutex
+	caches map[int]*StreamCredentialsCache
+}{
+	caches: make(map[int]*StreamCredentialsCache),
+}
+
+// getStreamCache returns or creates a shared cache for the given stream ID
+func getStreamCache(streamID int) *StreamCredentialsCache {
+	cacheID := getCacheID(streamID)
+
+	// Try read lock first for fast path
+	credentialsStore.mu.RLock()
+	cache, exists := credentialsStore.caches[cacheID]
+	credentialsStore.mu.RUnlock()
+
+	if exists {
+		return cache
+	}
+
+	// Need to create new cache
+	credentialsStore.mu.Lock()
+	defer credentialsStore.mu.Unlock()
+
+	// Double-check after acquiring write lock
+	if cache, exists = credentialsStore.caches[cacheID]; exists {
+		return cache
+	}
+
+	cache = &StreamCredentialsCache{}
+	credentialsStore.caches[cacheID] = cache
+	return cache
+}
+
+// invalidate invalidates the credentials cache for this stream
+func (c *StreamCredentialsCache) invalidate(streamID int) {
+	c.mutex.Lock()
+	c.creds = TurnCredentials{}
+	c.mutex.Unlock()
+
+	// Reset auth error counter
+	c.errorCount.Store(0)
+	c.lastErrorTime.Store(0)
+
+	log.Printf("[VK Auth] Credentials cache invalidated for stream %d", streamID)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// vkDelay sleeps for a random duration between minMs and maxMs to avoid bot detection
+func vkDelay(minMs, maxMs int) {
+	ms := minMs + rand.Intn(maxMs-minMs+1)
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+}
+
+// vkCredsMu serializes VK credential fetching to avoid BOT detection from parallel requests
+var vkCredsMu sync.Mutex
+
+// getVkCredsCached checks cache before fetching credentials
+func getVkCredsCached(ctx context.Context, link string, streamID int) (string, string, string, error) {
+	cache := getStreamCache(streamID)
+	cacheID := getCacheID(streamID)
+
+	cache.mutex.Lock()
+	defer cache.mutex.Unlock()
+
+	// Check cache - another stream may have populated it while waiting
+	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
+		expires := time.Until(cache.creds.ExpiresAt)
+		log.Printf("[VK Auth] Using cached credentials (cache=%d, expires in %v)", cacheID, expires)
+		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddr, nil
+	}
+
+	log.Printf("[VK Auth] Cache miss (cache=%d), starting credential fetch...", cacheID)
+
+	// Check context before long fetch
+	select {
+	case <-ctx.Done():
+		return "", "", "", ctx.Err()
+	default:
+	}
+
+	// Fetch credentials with mutex to avoid VK flood control
+	user, pass, addr, err := getVkCredsSafe(ctx, link, streamID)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	// Store in cache
+	cache.creds = TurnCredentials{
+		Username:   user,
+		Password:   pass,
+		ServerAddr: addr,
+		ExpiresAt:  time.Now().Add(credentialLifetime - cacheSafetyMargin),
+		Link:       link,
+	}
+
+	log.Printf("[VK Auth] Success! Credentials cached until %v (cache=%d)", cache.creds.ExpiresAt, cacheID)
+	return user, pass, addr, nil
+}
+
+// getVkCredsSafe wraps getVkCreds with mutex to avoid VK flood control
+func getVkCredsSafe(ctx context.Context, link string, streamID int) (string, string, string, error) {
+	vkCredsMu.Lock()
+	defer vkCredsMu.Unlock()
+	return getVkCreds(ctx, link)
+}
+
+func vkHTTPPost(ctx context.Context, data string, url string) (map[string]interface{}, error) {
+	client := &http.Client{
+		Timeout: 20 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+	defer client.CloseIdleConnections()
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewBuffer([]byte(data)))
+	if err != nil {
+		return nil, err
+	}
+	// Headers matching HAR capture exactly
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Origin", "https://vk.ru")
+	req.Header.Set("Referer", "https://vk.ru/")
+	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+	req.Header.Set("sec-ch-ua", `"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"`)
+	req.Header.Set("sec-ch-ua-mobile", "?0")
+	req.Header.Set("Sec-Fetch-Site", "same-site")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("DNT", "1")
+	req.Header.Set("Priority", "u=1, i")
+
+	httpResp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	// Handle HTTP errors (redirects, rate limits, etc.)
+	if httpResp.StatusCode >= 400 {
+		body, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("HTTP %d from %s: %s", httpResp.StatusCode, req.URL, string(body[:min(len(body), 500)]))
+	}
+
+	body, err := io.ReadAll(httpResp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check content type - VK may return HTML instead of JSON (captcha page, redirect, etc.)
+	contentType := httpResp.Header.Get("Content-Type")
+	if contentType != "" && !strings.Contains(contentType, "application/json") && !strings.Contains(contentType, "text/javascript") {
+		// Log first 500 chars of non-JSON response for debugging
+		logPreview := string(body)
+		if len(logPreview) > 500 {
+			logPreview = logPreview[:500] + "...(truncated)"
 		}
-		defer client.CloseIdleConnections()
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(data)))
-		if err != nil {
-			return nil, err
-		}
-
-		req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0")
-		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
-
-		httpResp, err := client.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		defer httpResp.Body.Close()
-
-		body, err := io.ReadAll(httpResp.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		err = json.Unmarshal(body, &resp)
-		if err != nil {
-			return nil, err
-		}
-
-		return resp, nil
+		return nil, fmt.Errorf("unexpected content-type %s, status %d, body: %s", contentType, httpResp.StatusCode, logPreview)
 	}
 
 	var resp map[string]interface{}
-	defer func() {
-		if r := recover(); r != nil {
-			log.Panicf("get TURN creds error: %v\n\n", resp)
+	if err = json.Unmarshal(body, &resp); err != nil {
+		// Log the raw body for debugging
+		logPreview := string(body)
+		if len(logPreview) > 500 {
+			logPreview = logPreview[:500] + "...(truncated)"
 		}
-	}()
-/*
-	data := "client_secret=QbYic1K3lEV5kTGiqlq2&client_id=6287487&scopes=audio_anonymous%2Cvideo_anonymous%2Cphotos_anonymous%2Cprofile_anonymous&isApiOauthAnonymEnabled=false&version=1&app_id=6287487"
-	url := "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err := doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
+		return nil, fmt.Errorf("JSON parse error: %w, body: %s", err, logPreview)
 	}
-
-	token1 := resp["data"].(map[string]interface{})["access_token"].(string)
-
-	data = fmt.Sprintf("access_token=%s", token1)
-	url = "https://api.vk.ru/method/calls.getAnonymousAccessTokenPayload?v=5.264&client_id=6287487"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token2 := resp["response"].(map[string]interface{})["payload"].(string)
-*/
-	//data = fmt.Sprintf("client_id=6287487&token_type=messages&payload=%s&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487", token2)
-	data := fmt.Sprintf("client_id=6287487&token_type=messages&client_secret=QbYic1K3lEV5kTGiqlq2&version=1&app_id=6287487")
-	url := "https://login.vk.ru/?act=get_anonym_token"
-
-	resp, err := doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token3 := resp["data"].(map[string]interface{})["access_token"].(string)
-
-	data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token3)
-	url = "https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=6287487"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token4 := resp["response"].(map[string]interface{})["token"].(string)
-
-	data = fmt.Sprintf("%s%s%s", "session_data=%7B%22version%22%3A2%2C%22device_id%22%3A%22", uuid.New(), "%22%2C%22client_version%22%3A1.1%2C%22client_type%22%3A%22SDK_JS%22%7D&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA")
-	url = "https://calls.okcdn.ru/fb.do"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	token5 := resp["session_key"].(string)
-
-	data = fmt.Sprintf("joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s", link, token4, token5)
-	url = "https://calls.okcdn.ru/fb.do"
-
-	resp, err = doRequest(data, url)
-	if err != nil {
-		return "", "", "", fmt.Errorf("request error:%s", err)
-	}
-
-	user := resp["turn_server"].(map[string]interface{})["username"].(string)
-	pass := resp["turn_server"].(map[string]interface{})["credential"].(string)
-	turn := resp["turn_server"].(map[string]interface{})["urls"].([]interface{})[0].(string)
-
-	clean := strings.Split(turn, "?")[0]
-	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
-
-	return user, pass, address, nil
+	return resp, nil
 }
 
-func getYandexCreds(link string) (string, string, string, error) {
+func getVkCreds(ctx context.Context, link string) (string, string, string, error) {
+	// Token 1 (messages)
+	log.Println("[VK Auth] Getting Token 1...")
+	data := fmt.Sprintf("client_id=%s&token_type=messages&client_secret=%s&version=1&app_id=%s",
+		vkClientID, vkClientSecret, vkClientID)
+	resp, err := vkHTTPPost(ctx, data, "https://login.vk.ru/?act=get_anonym_token")
+	if err != nil {
+		return "", "", "", fmt.Errorf("Token 1 request error: %w", err)
+	}
+	if errMsg, ok := resp["error"].(map[string]interface{}); ok {
+		return "", "", "", fmt.Errorf("Token 1 VK error: %v", errMsg)
+	}
+	dataObj, ok := resp["data"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("invalid Token 1 response: %v", resp)
+	}
+	token1, ok := dataObj["access_token"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("access_token not found in Token 1 response")
+	}
+	log.Println("[VK Auth] Token 1 received")
+	vkDelay(100, 200) // Token 1 → getCallPreview
+
+	// getCallPreview (optional, like browser)
+	log.Println("[VK Auth] Getting call preview...")
+	cpData := fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&fields=photo_200&access_token=%s",
+		url.QueryEscape(link), token1)
+	cpURL := fmt.Sprintf("https://api.vk.ru/method/calls.getCallPreview?v=%s&client_id=%s", vkAPIVersion, vkClientID)
+	_, _ = vkHTTPPost(ctx, cpData, cpURL) // non-critical
+	vkDelay(500, 1000) // getCallPreview → Token 2
+
+	// Token 2 (may require captcha)
+	log.Println("[VK Auth] Getting Token 2...")
+	t2Data := fmt.Sprintf("vk_join_link=https://vk.ru/call/join/%s&name=123&access_token=%s",
+		url.QueryEscape(link), token1)
+	t2URL := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=%s&client_id=%s", vkAPIVersion, vkClientID)
+	resp, err = vkHTTPPost(ctx, t2Data, t2URL)
+	if err != nil {
+		return "", "", "", fmt.Errorf("Token 2 request error: %w", err)
+	}
+
+	// Check for captcha error
+	if errMsg, ok := resp["error"].(map[string]interface{}); ok {
+		captchaData, isCaptcha := ExtractCaptchaData(errMsg)
+		if !isCaptcha {
+			return "", "", "", fmt.Errorf("Token 2 VK error: %v", errMsg)
+		}
+
+		log.Printf("[VK Auth] Captcha detected, solving...")
+		successToken, solveErr := SolveVkCaptcha(ctx, captchaData)
+		if solveErr != nil {
+			return "", "", "", fmt.Errorf("captcha solving failed: %w", solveErr)
+		}
+
+		// Delay before retry (endSession → Token 2 retry)
+		vkDelay(100, 200)
+
+		// Retry Token 2 with captcha solution
+		log.Println("[VK Auth] Retrying Token 2 with captcha solution...")
+		t2Data = fmt.Sprintf(
+			"vk_join_link=https://vk.ru/call/join/%s&name=123"+
+				"&captcha_key=&captcha_sid=%s&is_sound_captcha=0"+
+				"&success_token=%s&captcha_ts=%s&captcha_attempt=%s"+
+				"&access_token=%s",
+			url.QueryEscape(link),
+			captchaData.CaptchaSid,
+			successToken,
+			captchaData.CaptchaTs,
+			captchaData.CaptchaAttempt,
+			token1,
+		)
+		resp, err = vkHTTPPost(ctx, t2Data, t2URL)
+		if err != nil {
+			return "", "", "", fmt.Errorf("Token 2 retry request error: %w", err)
+		}
+		if errMsg2, ok := resp["error"].(map[string]interface{}); ok {
+			return "", "", "", fmt.Errorf("Token 2 retry VK error: %v", errMsg2)
+		}
+		// Token 2 retry → Token 3
+		vkDelay(100, 200)
+	}
+
+	token2Obj, ok := resp["response"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("invalid Token 2 response: %v", resp)
+	}
+	token2, ok := token2Obj["token"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("token not found in Token 2 response")
+	}
+	log.Println("[VK Auth] Token 2 received")
+	// Token 2 → Token 3
+	vkDelay(100, 200)
+
+	// Token 3 (OK auth.anonymLogin)
+	log.Println("[VK Auth] Getting Token 3...")
+	sessionData := fmt.Sprintf(`{"version":2,"device_id":"%s","client_version":1.1,"client_type":"SDK_JS"}`, uuid.New())
+	t3Data := fmt.Sprintf("session_data=%s&method=auth.anonymLogin&format=JSON&application_key=CGMMEJLGDIHBABABA",
+		url.QueryEscape(sessionData))
+	resp, err = vkHTTPPost(ctx, t3Data, "https://calls.okcdn.ru/fb.do")
+	if err != nil {
+		return "", "", "", fmt.Errorf("Token 3 request error: %w", err)
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return "", "", "", fmt.Errorf("Token 3 API error: %s", errMsg)
+	}
+	token3, ok := resp["session_key"].(string)
+	if !ok {
+		return "", "", "", fmt.Errorf("session_key not found in Token 3 response")
+	}
+	log.Println("[VK Auth] Token 3 received")
+	// Token 3 → Final (TURN)
+	vkDelay(100, 200)
+
+	// Final: vchat.joinConversationByLink (Token 4)
+	log.Println("[VK Auth] Getting TURN credentials (Token 4)...")
+	finalData := fmt.Sprintf(
+		"joinLink=%s&isVideo=false&protocolVersion=5&capabilities=2F7F&anonymToken=%s&method=vchat.joinConversationByLink&format=JSON&application_key=CGMMEJLGDIHBABABA&session_key=%s",
+		url.QueryEscape(link), token2, token3)
+	resp, err = vkHTTPPost(ctx, finalData, "https://calls.okcdn.ru/fb.do")
+	if err != nil {
+		return "", "", "", fmt.Errorf("Final request error: %w", err)
+	}
+	if errMsg, ok := resp["error"].(string); ok && errMsg != "" {
+		return "", "", "", fmt.Errorf("Final API error: %s", errMsg)
+	}
+
+	ts, ok := resp["turn_server"].(map[string]interface{})
+	if !ok {
+		return "", "", "", fmt.Errorf("turn_server not found in response: %v", resp)
+	}
+	urls, _ := ts["urls"].([]interface{})
+	if len(urls) == 0 {
+		return "", "", "", fmt.Errorf("urls not found in turn_server")
+	}
+	urlStr, _ := urls[0].(string)
+	clean := strings.Split(urlStr, "?")[0]
+	address := strings.TrimPrefix(strings.TrimPrefix(clean, "turn:"), "turns:")
+
+	username, _ := ts["username"].(string)
+	credential, _ := ts["credential"].(string)
+
+	if username == "" || credential == "" {
+		return "", "", "", fmt.Errorf("username or credential not found in turn_server")
+	}
+
+	log.Println("[VK Auth] TURN credentials received")
+	vkDelay(1500, 2500) // Final delay before exit
+	return username, credential, address, nil
+}
+
+func getYandexCreds(ctx context.Context, link string, streamID int) (string, string, string, error) {
 	const debug = false
 	const telemostConfHost = "cloud-api.yandex.ru"
 	telemostConfPath := fmt.Sprintf("%s%s%s", "/telemost_front/v2/telemost/conferences/https%3A%2F%2Ftelemost.yandex.ru%2Fj%2F", link, "/connection?next_gen_media_platform_allowed=false")
@@ -441,7 +698,8 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
 		ConnectionIDGenerator: dtls.OnlySendCIDGenerator(),
 	}
-	ctx1, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Extended timeout to accommodate serialized credential fetching via mutex
+	ctx1, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 	dtlsConn, err := dtls.Client(conn, peer, config)
 	if err != nil {
@@ -586,13 +844,14 @@ type turnParams struct {
 	port     string
 	link     string
 	udp      bool
+	streamID int
 	getCreds getCredsFunc
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, c chan<- error) {
 	var err error = nil
 	defer func() { c <- err }()
-	user, pass, url, err1 := turnParams.getCreds(turnParams.link)
+	user, pass, url, err1 := turnParams.getCreds(ctx, turnParams.link, turnParams.streamID)
 	if err1 != nil {
 		err = fmt.Errorf("failed to get TURN credentials: %s", err1)
 		return
@@ -785,7 +1044,11 @@ func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConnCha
 	}
 }
 
-func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time) {
+func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, connchan <-chan net.PacketConn, t <-chan time.Time, streamID int) {
+	// Create a copy of turnParams with the streamID
+	tp := *turnParams
+	tp.streamID = streamID
+	
 	for {
 		select {
 		case <-ctx.Done():
@@ -794,7 +1057,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			select {
 			case <-t:
 				c := make(chan error)
-				go oneTurnConnection(ctx, turnParams, peer, conn2, c)
+				go oneTurnConnection(ctx, &tp, peer, conn2, c)
 				if err := <-c; err != nil {
 					log.Printf("%s", err)
 				}
@@ -846,9 +1109,9 @@ func main() { //nolint:cyclop
 	if *vklink != "" {
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
-		getCreds = getVkCreds
+		getCreds = getVkCredsCached
 		if *n <= 0 {
-			*n = 16
+			*n = 4
 		}
 	} else {
 		parts := strings.Split(*yalink, "j/")
@@ -862,11 +1125,12 @@ func main() { //nolint:cyclop
 		link = link[:idx]
 	}
 	params := &turnParams{
-		*host,
-		*port,
-		link,
-		*udp,
-		getCreds,
+		host:     *host,
+		port:     *port,
+		link:     link,
+		udp:      *udp,
+		streamID: 0,
+		getCreds: getCreds,
 	}
 
 	var sessionID []byte
@@ -905,9 +1169,10 @@ func main() { //nolint:cyclop
 	if *direct {
 		for i := 0; i < *n; i++ {
 			wg1.Add(1)
+			streamID := i
 			go func() {
 				defer wg1.Done()
-				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t)
+				oneTurnConnectionLoop(ctx, params, peer, listenConnChan, t, streamID)
 			}()
 		}
 	} else {
@@ -923,7 +1188,7 @@ func main() { //nolint:cyclop
 		wg1.Add(1)
 		go func() {
 			defer wg1.Done()
-			oneTurnConnectionLoop(ctx, params, peer, connchan, t)
+			oneTurnConnectionLoop(ctx, params, peer, connchan, t, 0)
 		}()
 
 		select {
@@ -932,15 +1197,16 @@ func main() { //nolint:cyclop
 		}
 		for i := 0; i < *n-1; i++ {
 			connchan := make(chan net.PacketConn)
+			streamID := i + 1
 			wg1.Add(1)
-			go func(streamID byte) {
+			go func(sID byte) {
 				defer wg1.Done()
-				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil, sessionID, streamID)
-			}(byte(i + 1))
+				oneDtlsConnectionLoop(ctx, peer, listenConnChan, connchan, nil, sessionID, sID)
+			}(byte(streamID))
 			wg1.Add(1)
 			go func() {
 				defer wg1.Done()
-				oneTurnConnectionLoop(ctx, params, peer, connchan, t)
+				oneTurnConnectionLoop(ctx, params, peer, connchan, t, streamID)
 			}()
 		}
 	}
