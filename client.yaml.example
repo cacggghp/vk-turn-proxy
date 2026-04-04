@@ -1,0 +1,30 @@
+# VK TURN Proxy Client Configuration
+
+# The remote `vk-turn-proxy-server` location you want to stream traffic to.
+peer: "192.168.1.100:56000"
+
+# The local IPv4/IPv6 interface to accept VPN/WireGuard connections from.
+listen: "127.0.0.1:9000"
+
+# (Highly Recommended) The Pre-Shared Key used for authenticating the DTLS handshake. 
+secret: "your_secure_password_here"
+
+# The VK calls invite link used to fetch TURN credentials dynamically.
+vk_link: "https://vk.com/call/join/ABCDEFGH"
+
+# Alternatively, Yandex telemost invite link is supported
+# yandex_link: "https://telemost.yandex.ru/j/ZYXWVU"
+
+# Amount of simultaneous connections to the STUN/TURN provider. 
+# 16 is recommended for VK to saturate bandwidth. 1 is recommended for Yandex.
+threads: 16
+
+# Obfuscation toggle - connect to TURN directly using UDP without obfuscating headers.
+udp: false
+
+# Direct tunnel - connects without securing with DTLS (NOT RECOMMENDED).
+no_dtls: false
+
+# Advanced options if required:
+# turn: "77.88.8.8"
+# port: "3478"

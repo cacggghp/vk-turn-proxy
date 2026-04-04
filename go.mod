@@ -10,6 +10,7 @@ require (
 	github.com/pion/dtls/v3 v3.0.11
 	github.com/pion/logging v0.2.4
 	github.com/pion/turn/v5 v5.0.2
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

@@ -1,0 +1,8 @@
+# AUR packaging directories (each has its own git repo)
+packaging/vk-turn-proxy-server-bin/
+packaging/vk-turn-proxy-server-git/
+packaging/vk-turn-proxy-client-bin/
+packaging/vk-turn-proxy-client-git/
+
+# Build output
+build/

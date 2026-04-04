@@ -1,0 +1,11 @@
+# VK TURN Proxy Server Configuration
+
+# The local IPv4/IPv6 address and port to listen for incoming obfuscated TURN connections. 
+listen: "0.0.0.0:56000"
+
+# The local WireGuard or other UDP VPN server address to route packets into.
+connect: "127.0.0.1:51820"
+
+# (Highly Recommended) The Pre-Shared Key used for authenticating the DTLS handshake. 
+# Protects your proxy from Man-in-the-Middle attacks.
+secret: "your_secure_password_here"

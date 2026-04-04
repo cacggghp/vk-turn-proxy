@@ -1,335 +1,267 @@
-# Good TURN
+<div align="center">
+  <h1>🛡️ Good TURN</h1>
+  <p>
+    <b>Проброс WireGuard / Hysteria через TURN серверы VK Звонков или Яндекс Телемоста</b>
+  </p>
+  <p>
+    <a href="https://github.com/Mat1RX/vk-turn-proxy/releases">
+      <img src="https://img.shields.io/github/v/release/Mat1RX/vk-turn-proxy?style=flat-square&color=blue" alt="Release">
+    </a>
+    <a href="https://aur.archlinux.org/packages/vk-turn-proxy-server-bin">
+      <img src="https://img.shields.io/aur/version/vk-turn-proxy-server-bin?style=flat-square&color=1793d1&logo=archlinux" alt="AUR">
+    </a>
+    <a href="https://golang.org/">
+      <img src="https://img.shields.io/badge/Language-Go-00ADD8?style=flat-square&logo=go" alt="Language">
+    </a>
+  </p>
+</div>
 
-Проброс трафика WireGuard/Hysteria через TURN сервера VK звонков или ~~Яндекс телемоста~~. Пакеты шифруются DTLS 1.2, затем параллельными потоками через TCP или UDP отправляются на TURN сервер по протоколу STUN ChannelData. Оттуда по UDP отправляются на ваш сервер, где расшифровываются и передаются в WireGuard. Логин/пароль от TURN генерируются из ссылки на звонок.
+---
 
-Только для учебных целей!
+> [!WARNING]
+> **Внимание:** Проект создан **исключительно для учебных целей**! Автор не несет ответственности за использование данного ПО.
 
-## Похожие проекты
-- https://github.com/MYSOREZ/vk-turn-proxy-android - клиент для андроида
-- https://github.com/kiper292/wireguard-turn-android - клиент для андроида интегрированный в WireGuard
-- https://github.com/WINGS-N/WINGSV - клиент для андроида с One UI, WireGuard, раздачей VPN с root
-- https://github.com/nullcstring/turnbridge - клиент для IOS
-- https://github.com/Urtyom-Alyanov/turn-proxy - реализация на Rust
-- https://github.com/jaykaiperson/lionheart - аналог для https://stream.wb.ru (статья: https://habr.com/ru/articles/1017410/)
-- https://github.com/kulikov0/whitelist-bypass - проброс через медиасервер SFU ВК и Яндекс Телемоста
+Трафик шифруется с помощью **DTLS 1.2** и передаётся через **STUN ChannelData**, маскируясь под легитимный WebRTC звонок в VK или Яндекс Телемост. Это делает его крайне сложным для выявления средствами DPI без блокировки всей инфраструктуры звонков платформы.
 
-## Настройка
+## ⚙️ Принцип работы
 
-Нам понадобится:
+```mermaid
+flowchart TD
+    WG[WireGuard / Клиент] -->|UDP :9000| client[vk-turn-proxy-client]
+    
+    subgraph Client-Side
+    client
+    end
+    
+    client -.->|1. Fetch Credentials| API(VK / Yandex API)
+    client -->|2. Обфускация DTLS 1.2| TURN
+    
+    subgraph Relay
+    TURN((TURN Сервер\nVK / Яндекс))
+    end
+    
+    TURN -->|3. STUN ChannelData\nUDP / TCP| server[vk-turn-proxy-server]
+    
+    subgraph Server-Side VPS
+    server
+    end
+    
+    server -->|UDP :51820| WGS[WireGuard Сервер]
+```
 
-1. Ссылка на действующий ВК звонок: создаём свой (нужен аккаунт вк), или гуглим `"https://vk.com/call/join/"`.
-   Ссылка действительна вечно, если не нажимать "завершить звонок для всех"
-2. Или ссыска на звонок Яндекс телемоста: `"https://telemost.yandex.ru/j/"`. Её лучше не гуглить, так как видно подключение к конференции
-3. VPS с установленным WireGuard
-4. Для андроида: скачать Termux из F-Droid
+1. **Получение TURN-credentials**: Прокси обращается к API VK/Яндекса через ссылку на звонок для получения одноразовых доступов. DNS-запросы идут через резолверы VK (`77.88.8.8`) и Google для обхода локальных блокировок.
+2. **DTLS 1.2 — слой обфускации**: Создается DTLS соединение к серверу. Использование ключа (Pre-Shared Key) **обязательно** для защиты от MitM-атак и несанкционированного доступа. При использовании файла конфигурации (`.yaml`), ключ будет **сгенерирован автоматически**, если вы его не укажете! Пакеты WireGuard инкапсулируются внутри DTLS-потока, обфусцируя сигнатуры для DPI.
+3. **TURN relay**: Передача пакетов идет на TURN-сервер платформы, а он уже перенаправляет их на ваш VPS. Для **VK** дополнительно открывается 16 параллельных потоков для обхода ограничения скорости в ~5 Мбит/с.
+4. **Auto-Reconnect (Надежность)**: Клиент оснащен логикой *Exponential Backoff*. При падении интернета, прокси не вылетает, а бесшовно перестраивает туннель, гарантируя стабильную работу VPN.
+5. **Dynamic Identity (Анти-фрод)**: При каждом новом подключении к API прокси генерирует уникальное реалистичное имя бота и подменяет `User-Agent` (случайно выбирая между профилями Safari, Mobile, Windows Chrome, Yandex), что позволяет полностью сливаться с легитимным трафиком и избегать автоматических блокировок.
 
-### Сервер
+---
 
-<details><summary>Рекомендуется tmux</summary>
+## 🚀 Установка
 
-На сервере запустить tmux:
+### 🐧 Debian / Ubuntu (Systemd)
 
+Самый популярный способ установки для VPS:
+
+1. Скачайте последний релиз со страницы [Releases](https://github.com/cacggghp/vk-turn-proxy/releases).
+2. Распакуйте и поместите бинарник в `/usr/local/bin/`:
 ```bash
-# Создание сессии tmux
-tmux new -s vkturn
+sudo mv vk-turn-proxy-server /usr/local/bin/
+sudo chmod +x /usr/local/bin/vk-turn-proxy-server
 ```
-
-Внутри сессии tmux запустить команду сервера ниже. Далее нажать `Ctrl+B` `D`, чтобы свернуть сессию, не завершая её. Прокси процесс останется запущенным, сервер будет доступен для новых команд или безопасного выхода из него.
-
+3. Создайте файл конфигурации:
 ```bash
-# Войти в ранее созданную сессию tmux
-tmux a -t vkturn
+sudo mkdir -p /etc/vk-turn-proxy
+sudo nano /etc/vk-turn-proxy/server.yaml
 ```
-
-</details>
-
-Скачать бинарник, в данном примере используется самый популярный сервер `server-linux-amd64`:
-
-```bash
-# Скачать бинарник
-curl -L -o server https://github.com/cacggghp/vk-turn-proxy/releases/latest/download/server-linux-amd64 && chmod +x server
-```
-
-```bash
-# Запуск сервера
-./server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg>
-```
-#### Установка демона
-На сервере в файле `/etc/systemd/system/vk-turn-proxy.service`
-```
+4. Создайте Systemd сервис (`sudo nano /etc/systemd/system/vk-turn-proxy-server.service`):
+```ini
 [Unit]
-Description=VK Turn Proxy Service
+Description=VK TURN Proxy Server
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/opt/vk-turn-proxy/server-linux-amd64 -listen 0.0.0.0:56000 -connect 127.0.0.1:<wg_port>
-KillMode=process
+ExecStart=/usr/local/bin/vk-turn-proxy-server -c /etc/vk-turn-proxy/server.yaml
 Restart=always
-RestartSec=5
 User=nobody
-Group=nogroup
-StandardOutput=append:/var/log/vk-turn-proxy/vk-turn-proxy.log
-StandardError=append:/var/log/vk-turn-proxy/vk-turn-proxy_error.log
-SyslogIdentifier=vk-turn-proxy
 
 [Install]
 WantedBy=multi-user.target
 ```
-Где `/opt/vk-turn-proxy/server-linux-amd64` - путь к файлу, `<wg_port>` - порт сервера wg
-```
-systemctl daemon-reload
-systemctl enable vk-turn-proxy.service
-systemctl start vk-turn-proxy.service
-```
-#### Docker
-
-Образ Docker публикуется в GitHub Container Registry:
-
-```
-docker pull ghcr.io/cacggghp/vk-turn-proxy:latest
-docker tag ghcr.io/cacggghp/vk-turn-proxy:latest vkt
+5. Запустите:
+```bash
+sudo systemctl enable --now vk-turn-proxy-server
 ```
 
-Для Linux-сервера, где `xray` или WireGuard слушает локально, удобнее запускать через host network:
+### 🐳 Docker (сервер)
 
-```
-docker run --rm --network host -e CONNECT_ADDR=127.0.0.1:<порт wg> vkt
-```
-
-Если нужен bridge mode:
-
-```
-docker run --rm -p 56000:56000/udp -e CONNECT_ADDR=<ip хоста>:<порт wg> vkt
-```
-
-Сборка образа вручную:
-
-```
-git clone https://github.com/cacggghp/vk-turn-proxy.git
-cd vk-turn-proxy
-docker build -t vk-turn-proxy .
-```
-
-Переменная окружения **CONNECT_ADDR** — адрес WireGuard (обязательный), например `192.168.1.10:51820`.
-
-Пример запуска:
-
-```
-docker run -p 56000:56000/udp -e CONNECT_ADDR=192.168.1.10:51820 vk-turn-proxy
-```
-
-### Клиент
-
-#### Android
-
-**Рекомендуемый способ:**
-Использовать нативное Android-приложение [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android).
-
-- В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
-- **Добавляем приложение в исключения WireGuard. Нажимаем "сохранить".**
-
-**Альтернативный способ (через Termux):**
-
-- В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
-- **Добавляем Termux в исключения WireGuard. Нажимаем "сохранить".**
-  В Termux:
-
-```
-termux-wake-lock
-```
-
-Телефон не будет уходить в глубокий сон, так что на ночь ставьте на зарядку. Чтобы отключить:
-
-```
-termux-wake-unlock
-```
-
-Скачиваем бинарник в локальную папку, даём права на исполнение, в команде указаана самая популярная архитектура `client-android-arm64`:
+Вы можете развернуть серверную часть через Docker одним запуском:
 
 ```bash
-curl -L -o client https://github.com/cacggghp/vk-turn-proxy/releases/latest/download/client-android-arm64 && chmod +x client
+docker pull ghcr.io/cacggghp/vk-turn-proxy:latest
+docker run -d --restart unless-stopped -p 56000:56000/udp \
+  -e CONNECT_ADDR=192.168.1.10:51820 \
+  -e SECRET="my-strong-password" \
+  --name vk-turn-proxy ghcr.io/cacggghp/vk-turn-proxy:latest
 ```
 
-Запускаем:
+### 💙 Arch Linux (AUR)
 
-```
-./client -listen 127.0.0.1:9000 -peer <ip сервера wg>:56000 -vk-link <VK ссылка>
-```
+В Arch Linux вы можете использовать AUR хелпер:
 
-Или
-
-```
-./client -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000
+```bash
+yay -S vk-turn-proxy-server-bin   # сервер
+yay -S vk-turn-proxy-client-bin   # клиент
 ```
 
-**Если после включения VPN в терминале вылезают ошибки DNS, попробуйте в Wireguard включить VPN только для нужных приложений.**
+---
 
-#### IOS
-- https://github.com/cacggghp/vk-turn-proxy/issues/76
-#### Linux
+## 🛠 Использование
 
-В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
+**Что вам понадобится:**
+- **Ссылка на VK Звонок** (`https://vk.com/call/join/...`). Создайте свой звонок, ссылка действует вечно (если не завершить для всех).
+- *Или* **Ссылка на Яндекс Телемост** (`https://telemost.yandex.ru/j/...`).
+- **VPS** с установленным и настроенным WireGuard сервером.
 
-Скрипт будет добавлять маршруты к нужным ip:
+### Запуск сервера
 
-```
-./client-linux -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 | sudo routes.sh
-```
+На сервере (вашем VPS) выполните:
 
-```
-./client-linux -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000 | sudo routes.sh
-```
+```bash
+# Через флаги:
+./vk-turn-proxy-server -listen 0.0.0.0:56000 -connect 127.0.0.1:<порт wg> -secret "my-strong-password"
 
-Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
-
-#### Windows
-
-В клиентском конфиге WireGuard меняем адрес сервера на `127.0.0.1:9000`, ставим MTU 1280
-
-В PowerShell от Администратора (чтобы скрипт прописывал маршруты):
-
-```
-./client.exe -peer <ip сервера wg>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 | routes.ps1
+# ИЛИ через конфигурационный файл:
+./vk-turn-proxy-server -c server.yaml.example
 ```
 
+### Запуск клиента
+
+> [!CAUTION]
+> **Важно:** В конфигурации клиента WireGuard укажите `Endpoint = 127.0.0.1:9000` и `MTU = 1280`. Не подключайте VPN до того, как `vk-turn-proxy-client` успешно установит соединение! (Для Linux/Windows)
+
+**🐧 Linux:**
+```bash
+# Через длинные флаги:
+./vk-turn-proxy-client -peer <ip VPS>:56000 -vk-link <ссылка> -listen 127.0.0.1:9000 -secret "my-strong-password"
+
+# ИЛИ через красивый конфигурационный файл:
+./vk-turn-proxy-client -c client.yaml.example
 ```
-./client.exe -udp -turn 5.255.211.241 -peer <ip сервера wg>:56000 -yandex-link <Ya ссылка> -listen 127.0.0.1:9000 | routes.ps1
+
+**🪟 Windows** (PowerShell от имени Администратора):
+```powershell
+.\client.exe -c client.yaml.example
 ```
 
-Не включайте впн, пока программа не установит соединение! В отличие от андроида, здесь часть запросов будет идти через впн (dns и запрос подключения к turn)
+**📱 Android:** 
+Лучше всего использовать адаптацию [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android) или запустить клиентское ядро через Termux.
 
-### Если не работает
+---
 
-С помощью опции `-turn` можно указать адрес TURN сервера вручную. Это должен быть сервер ВК, Макса или Одноклассников (ссылка вк) или Яндекса (ссылка яндекса). Возможно потом составлю список.
+## 🎛 Флаги запуска клиента
 
-Если не работает TCP, попробуйте добавить флаг `-udp`.
+| Флаг | Описание | По умолчанию |
+|------|----------|--------------|
+| `-c` | Путь к файлу конфигурации YAML (Например: `client.yaml`) | - |
+| `-peer` | **Обязательный.** Адрес вашего сервера `host:port` | - |
+| `-vk-link` | Ссылка-инвайт на VK Звонок | - |
+| `-yandex-link` | Ссылка-инвайт на Яндекс Телемост | - |
+| `-listen` | Локальный интерфейс и порт для прослушивания трафика VPN | `127.0.0.1:9000` |
+| `-secret` | **Обязательный.** PSK-пароль. При запуске через `.yaml` файл генерируется **автоматически**, если не указан. | - |
+| `-n` | Количество потоков TURN (рекомендуется `16` для VK, `1` для Яндекса) | `16` / `1` |
+| `-udp` | Использовать UDP протокол для подключения к TURN | `false` (over TCP) |
+| `-turn` | Указать IP TURN сервера вручную | - |
+| `-no-dtls` | **Опасно.** Отключить слои обфускации (может привести к бану) | `false` |
 
-Добавьте флаг `-n 1` для более стабильного подключения в 1 поток (ограничение 5 Мбит/с для ВК)
+---
 
-## Яндекс телемост
+## 🟡 Настройки для Яндекс Телемоста
 
-**UPD. ТЕЛЕМОСТ ЗАКРЫЛИ**
+> [!WARNING]
+> **UPD: Сервис ТЕЛЕМОСТ почти ЗАКРЫЛИ**
 
-В отличие от ВК, сервера яндекса не ограничивают скорость, так что по умолчанию стоит `-n 1`. Увеличение этого числа может привести к временной блокировке по IP из-за переполнения конференции фейковыми участниками.
-
-В режиме `-udp` скорость обычно больше
-
-Большинство диапазонов IP TURN серверов Яндекса не работают, указывайте вручную через `-turn`
+Если вы все еще используете Я.Телемост, помните:
+- По умолчанию следует использовать флаг `-n 1`, так как нет ограничений скорости.
+- Увеличение числа `-n` может привести к бану по IP за обилие пустых (фейковых) подключений.
+- Рекомендуется активировать флаг `-udp` в связке с конкретными IP адресами.
 
 <details>
-    <summary>
-        Рабочие IP
-    </summary>
+<summary><b>Список рабочих IP TURN серверов Яндекса</b> <i>(использовать с флагом <code>-turn</code>)</i></summary>
 
-    5.255.211.241
-    5.255.211.242
-    5.255.211.243
-    5.255.211.245
-    5.255.211.246
-
+```text
+5.255.211.241
+5.255.211.242
+5.255.211.243
+5.255.211.245
+5.255.211.246
+```
 </details>
-Спасибо https://github.com/KillTheCensorship/Turnel за часть кода :)
 
-## v2ray
+---
 
-Вместо WireGuard можно использовать любое V2Ray-ядро которое его поддерживает (например, xray или sing-box) и любой V2Ray-клиент который использует это ядро (например, v2rayN или v2rayNG). С помощью их вы сможете добавить больше входящих интерфейсов (например, SOCKS) и реализовать точечный роутинг.
+## 🎭 Совместимость с V2Ray
 
-Пример конфигов:
+Вместо WireGuard можно использовать `xray-core` или `sing-box`. Это позволит гибче настроить маршрутизацию (например, через SOCKS5 для точечного обхода блокировок). Примеры конфигураций:
 
 <details>
-
-<summary>
-Клиент
-</summary>
+<summary><b>💻 Клиент (xray)</b></summary>
 
 ```json
 {
-  "inbounds": [
-    {
-      "protocol": "socks",
-      "listen": "127.0.0.1",
-      "port": 1080,
-      "settings": {
-        "udp": true
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    },
-    {
-      "protocol": "http",
-      "listen": "127.0.0.1",
-      "port": 8080,
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "wireguard",
-      "settings": {
-        "secretKey": "<client secret key>",
-        "peers": [
-          {
-            "endpoint": "127.0.0.1:9000",
-            "publicKey": "<server public key>"
+    "inbounds": [
+        { "protocol": "socks", "listen": "127.0.0.1", "port": 1080,
+          "settings": { "udp": true },
+          "sniffing": { "enabled": true, "destOverride": ["http","tls"] } },
+        { "protocol": "http", "listen": "127.0.0.1", "port": 8080,
+          "sniffing": { "enabled": true, "destOverride": ["http","tls"] } }
+    ],
+    "outbounds": [
+        { "protocol": "wireguard",
+          "settings": {
+              "secretKey": "<client secret key>",
+              "peers": [{ "endpoint": "127.0.0.1:9000", "publicKey": "<server public key>" }],
+              "domainStrategy": "ForceIPv4", "mtu": 1280
           }
-        ],
-        "domainStrategy": "ForceIPv4",
-        "mtu": 1280
-      }
-    }
-  ]
+        }
+    ]
 }
 ```
-
 </details>
 
 <details>
-
-<summary>
-Сервер
-</summary>
+<summary><b>🌍 Сервер (xray)</b></summary>
 
 ```json
 {
-  "inbounds": [
-    {
-      "protocol": "wireguard",
-      "listen": "0.0.0.0",
-      "port": 51820,
-      "settings": {
-        "secretKey": "<server secret key>",
-        "peers": [
-          {
-            "publicKey": "<client public key>"
-          }
-        ],
-        "mtu": 1280
-      },
-      "sniffing": {
-        "enabled": true,
-        "destOverride": ["http", "tls"]
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {
-        "domainStrategy": "UseIPv4"
-      }
-    }
-  ]
+    "inbounds": [
+        { "protocol": "wireguard", "listen": "0.0.0.0", "port": 51820,
+          "settings": {
+              "secretKey": "<server secret key>",
+              "peers": [{ "publicKey": "<client public key>" }],
+              "mtu": 1280
+          },
+          "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
+        }
+    ],
+    "outbounds": [
+        { "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } }
+    ]
 }
 ```
-
 </details>
 
-## Direct mode
+---
 
-С флагом `-no-dtls` можно отправлять пакеты без обфускации DTLS и подключаться к обычным серверам Wireguard. Может привести к бану от вк/яндекса.
+## 🔗 Похожие проекты
+- [vk-turn-proxy-android](https://github.com/MYSOREZ/vk-turn-proxy-android) - клиент для андроида
+- [wireguard-turn-android](https://github.com/kiper292/wireguard-turn-android) - клиент для андроида интегрированный в WireGuard
+- [WINGSV](https://github.com/WINGS-N/WINGSV) - клиент для андроида с One UI, WireGuard, раздачей VPN с root
+- [turnbridge](https://github.com/nullcstring/turnbridge) - клиент для IOS
+- [turn-proxy](https://github.com/Urtyom-Alyanov/turn-proxy) - реализация на Rust
+- [lionheart](https://github.com/jaykaiperson/lionheart) - аналог для https://stream.wb.ru (статья: https://habr.com/ru/articles/1017410/)
+- [whitelist-bypass](https://github.com/kulikov0/whitelist-bypass) - проброс через медиасервер SFU ВК и Яндекс Телемоста
+
+<div align="center">
+  <sub>Основано на открытом исходном коде. Спасибо проекту <a href="https://github.com/KillTheCensorship/Turnel">Turnel</a> за часть кода. ❤️</sub>
+</div>

@@ -2,208 +2,90 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
-	"time"
 
-	"github.com/pion/dtls/v3"
-	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
+	"github.com/cacggghp/vk-turn-proxy/internal/config"
+	"github.com/cacggghp/vk-turn-proxy/internal/server"
 )
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "=======================================================================\n")
+		fmt.Fprintf(os.Stderr, " 🛡️ VK TURN Proxy Server\n")
+		fmt.Fprintf(os.Stderr, "=======================================================================\n")
+		fmt.Fprintf(os.Stderr, " Серверная часть прокси для обхода блокировок DPI через звонки VK/Яндекса.\n")
+		fmt.Fprintf(os.Stderr, " Принимает зашифрованный DTLS 1.2 трафик (перенаправленный через TURN),\n")
+		fmt.Fprintf(os.Stderr, " деобфусцирует его и передает на локальный UDP VPN сервер (WireGuard/Hysteria).\n\n")
+		fmt.Fprintf(os.Stderr, " 📜 Использование:\n")
+		fmt.Fprintf(os.Stderr, "   vk-turn-proxy-server [options]\n\n")
+		fmt.Fprintf(os.Stderr, " 🔧 Доступные параметры:\n")
+		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\n 🚀 Пример запуска:\n")
+		fmt.Fprintf(os.Stderr, "   ./vk-turn-proxy-server -listen 0.0.0.0:56000 -connect 127.0.0.1:51820 -secret \"mypassword\"\n")
+	}
+
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
-	connect := flag.String("connect", "", "connect to ip:port")
+	connect := flag.String("connect", "", "connect to ip:port (required)")
+	secret := flag.String("secret", "", "optional PSK (Pre-Shared Key) for DTLS authentication")
+	cfgFile := flag.String("c", "", "path to config.yaml file")
 	flag.Parse()
+
+	if len(os.Args) == 1 {
+		flag.Usage()
+		os.Exit(0)
+	}
+
+	yamlConfig, err := config.LoadServerConfig(*cfgFile)
+	if err != nil {
+		log.Fatalf("failed to configure yaml: %v", err)
+	}
+
+	explicit := config.GetExplicitFlags()
+	finalListen := config.MergeFlagString(explicit, "listen", *listen, yamlConfig.Listen, "0.0.0.0:56000")
+	finalConnect := config.MergeFlagString(explicit, "connect", *connect, yamlConfig.Connect, "")
+	finalSecret := config.MergeFlagString(explicit, "secret", *secret, yamlConfig.Secret, "")
+
+	if finalConnect == "" {
+		fmt.Fprintf(os.Stderr, "error: -connect or yaml config mapping is required\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
+
+	if finalSecret == "" {
+		fmt.Fprintf(os.Stderr, "error: DTLS secret is strictly required for secure authentication. Use -secret or specify it in the config file.\n\n")
+		flag.Usage()
+		os.Exit(1)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, syscall.SIGTERM, syscall.SIGINT)
 	go func() {
 		<-signalChan
 		log.Printf("Terminating...\n")
 		cancel()
-		<-signalChan
+		<-signalChan // forceful exit if signal received twice
 		log.Fatalf("Exit...\n")
 	}()
 
-	addr, err := net.ResolveUDPAddr("udp", *listen)
-	if err != nil {
-		panic(err)
-	}
-	if len(*connect) == 0 {
-		log.Panicf("server address is required")
-	}
-	// Generate a certificate and private key to secure the connection
-	certificate, genErr := selfsign.GenerateSelfSigned()
-	if genErr != nil {
-		panic(err)
-	}
+	finalHandshakeLimit := config.MergeFlagInt(explicit, "handshake_limit", 0, yamlConfig.HandshakeLimit, 100)
 
-	//
-	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
-	//
-
-	// Prepare the configuration of the DTLS connection
-	config := &dtls.Config{
-		Certificates:          []tls.Certificate{certificate},
-		ExtendedMasterSecret:  dtls.RequireExtendedMasterSecret,
-		CipherSuites:          []dtls.CipherSuiteID{dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256},
-		ConnectionIDGenerator: dtls.RandomCIDGenerator(8),
-	}
-
-	// Connect to a DTLS server
-	listener, err := dtls.Listen("udp", addr, config)
-	if err != nil {
-		panic(err)
-	}
-	context.AfterFunc(ctx, func() {
-		if err = listener.Close(); err != nil {
-			panic(err)
-		}
+	srv := server.New(server.Config{
+		ListenAddr:     finalListen,
+		ConnectAddr:    finalConnect,
+		Secret:         finalSecret,
+		HandshakeLimit: finalHandshakeLimit,
 	})
 
-	fmt.Println("Listening")
-
-	wg1 := sync.WaitGroup{}
-	for {
-		select {
-		case <-ctx.Done():
-			wg1.Wait()
-			return
-		default:
-		}
-		// Wait for a connection.
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Println(err)
-			continue
-		}
-		wg1.Add(1)
-		go func(conn net.Conn) {
-			defer wg1.Done()
-			defer func() {
-				if closeErr := conn.Close(); closeErr != nil {
-					log.Printf("failed to close incoming connection: %s", closeErr)
-				}
-			}()
-			var err error = nil
-			log.Printf("Connection from %s\n", conn.RemoteAddr())
-			// `conn` is of type `net.Conn` but may be casted to `dtls.Conn`
-			// using `dtlsConn := conn.(*dtls.Conn)` in order to to expose
-			// functions like `ConnectionState` etc.
-
-			// Perform the handshake with a 30-second timeout
-			ctx1, cancel1 := context.WithTimeout(ctx, 30*time.Second)
-			dtlsConn, ok := conn.(*dtls.Conn)
-			if !ok {
-				log.Println("Type error")
-				cancel1()
-				return
-			}
-			log.Println("Start handshake")
-			if err = dtlsConn.HandshakeContext(ctx1); err != nil {
-				log.Println(err)
-				cancel1()
-				return
-			}
-			cancel1()
-			log.Println("Handshake done")
-
-			serverConn, err := net.Dial("udp", *connect)
-			if err != nil {
-				log.Println(err)
-				return
-			}
-			defer func() {
-				if err = serverConn.Close(); err != nil {
-					log.Printf("failed to close outgoing connection: %s", err)
-					return
-				}
-			}()
-
-			var wg sync.WaitGroup
-			wg.Add(2)
-			ctx2, cancel2 := context.WithCancel(ctx)
-			context.AfterFunc(ctx2, func() {
-				if err := conn.SetDeadline(time.Now()); err != nil {
-					log.Printf("failed to set incoming deadline: %s", err)
-				}
-				if err := serverConn.SetDeadline(time.Now()); err != nil {
-					log.Printf("failed to set outgoing deadline: %s", err)
-				}
-			})
-			go func() {
-				defer wg.Done()
-				defer cancel2()
-				buf := make([]byte, 1600)
-				for {
-					select {
-					case <-ctx2.Done():
-						return
-					default:
-					}
-					if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					n, err1 := conn.Read(buf)
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-
-					if err1 := serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					_, err1 = serverConn.Write(buf[:n])
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-				}
-			}()
-			go func() {
-				defer wg.Done()
-				defer cancel2()
-				buf := make([]byte, 1600)
-				for {
-					select {
-					case <-ctx2.Done():
-						return
-					default:
-					}
-					if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					n, err1 := serverConn.Read(buf)
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-
-					if err1 := conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-					_, err1 = conn.Write(buf[:n])
-					if err1 != nil {
-						log.Printf("Failed: %s", err1)
-						return
-					}
-				}
-			}()
-			wg.Wait()
-			log.Printf("Connection closed: %s\n", conn.RemoteAddr())
-		}(conn)
+	log.Printf("Starting VK TURN Proxy server...\n")
+	if err := srv.Run(ctx); err != nil {
+		log.Fatalf("server exited with error: %v", err)
 	}
 }
