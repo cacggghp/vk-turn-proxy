@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/internal/api/identity"
 	"github.com/google/uuid"
 )
 
 const (
-	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 	clientID       = "6287487"
 	clientSecret   = "QbYic1K3lEV5kTGiqlq2"
 	applicationKey = "CGMMEJLGDIHBABABA" // For OKCDN
@@ -46,13 +46,17 @@ func GetCreds(link string, dialer *dnsdialer.Dialer) (user string, pass string, 
 	}
 	defer client.CloseIdleConnections()
 
+	prof := identity.GetRandomProfile()
+	name := identity.GenerateName()
+	escapedName := neturl.QueryEscape(name)
+
 	doRequest := func(data string, url string, out interface{}) error {
 		req, reqErr := http.NewRequestWithContext(context.Background(), "POST", url, bytes.NewBufferString(data))
 		if reqErr != nil {
 			return reqErr
 		}
 
-		req.Header.Add("User-Agent", userAgent)
+		req.Header.Add("User-Agent", prof.UserAgent)
 		req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 		resp, doErr := client.Do(req)
@@ -88,7 +92,7 @@ func GetCreds(link string, dialer *dnsdialer.Dialer) (user string, pass string, 
 	token1 := resp1.Data.AccessToken
 
 	// 2. Get anonymous call token using the invite link
-	data2 := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s", link, token1)
+	data2 := fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s", link, escapedName, token1)
 	url2 := fmt.Sprintf("https://api.vk.ru/method/calls.getAnonymousToken?v=5.274&client_id=%s", clientID)
 	var token2 string
 	const maxCaptchaAttempts = 3
@@ -108,7 +112,7 @@ func GetCreds(link string, dialer *dnsdialer.Dialer) (user string, pass string, 
 
 				captchaErr := parseVkCaptchaError(errObj)
 				if captchaErr.SessionToken != "" {
-					successToken, solveErr := solveVkCaptcha(context.Background(), captchaErr, dialer)
+					successToken, solveErr := solveVkCaptcha(context.Background(), captchaErr, dialer, prof.UserAgent)
 					if solveErr != nil {
 						return "", "", "", fmt.Errorf("auto captcha solve error: %w", solveErr)
 					}
@@ -117,8 +121,8 @@ func GetCreds(link string, dialer *dnsdialer.Dialer) (user string, pass string, 
 						captchaErr.CaptchaAttempt = "1"
 					}
 
-					data2 = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=123&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s",
-						link, token1, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt)
+					data2 = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&access_token=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s",
+						link, escapedName, token1, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt)
 					continue
 				} else {
 					return "", "", "", fmt.Errorf("old image captcha detected - not supported in auto solver")

@@ -9,12 +9,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/internal/api/identity"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	userAgent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) Gecko/20100101 Firefox/144.0"
 	telemostConfHost = "cloud-api.yandex.ru"
 )
 
@@ -137,6 +137,9 @@ type WSSData struct {
 func GetCreds(link string) (user string, pass string, address string, err error) {
 	telemostConfPath := fmt.Sprintf("/telemost_front/v2/telemost/conferences/https%%3A%%2F%%2Ftelemost.yandex.ru%%2Fj%%2F%s/connection?next_gen_media_platform_allowed=false", link)
 
+	prof := identity.GetRandomProfile()
+	name := identity.GenerateName()
+
 	endpoint := "https://" + telemostConfHost + telemostConfPath
 	client := &http.Client{
 		Timeout: 20 * time.Second,
@@ -152,7 +155,7 @@ func GetCreds(link string) (user string, pass string, address string, err error)
 	if err != nil {
 		return "", "", "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("User-Agent", prof.UserAgent)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Referer", "https://telemost.yandex.ru/")
 	req.Header.Set("Origin", "https://telemost.yandex.ru")
@@ -183,7 +186,7 @@ func GetCreds(link string) (user string, pass string, address string, err error)
 
 	h := http.Header{}
 	h.Set("Origin", "https://telemost.yandex.ru")
-	h.Set("User-Agent", userAgent)
+	h.Set("User-Agent", prof.UserAgent)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -199,14 +202,14 @@ func GetCreds(link string) (user string, pass string, address string, err error)
 		UID: uuid.New().String(),
 		Hello: HelloPayload{
 			ParticipantMeta: PartMeta{
-				Name:        "Гость",
+				Name:        name,
 				Role:        "SPEAKER",
 				Description: "",
 				SendAudio:   false,
 				SendVideo:   false,
 			},
 			ParticipantAttributes: PartAttrs{
-				Name:        "Гость",
+				Name:        name,
 				Role:        "SPEAKER",
 				Description: "",
 			},
@@ -221,7 +224,7 @@ func GetCreds(link string) (user string, pass string, address string, err error)
 			SdkInfo: SdkInfo{
 				Implementation: "browser",
 				Version:        "5.15.0",
-				UserAgent:      userAgent,
+				UserAgent:      prof.UserAgent,
 				HwConcurrency:  4,
 			},
 			SdkInitializationID:    uuid.New().String(),

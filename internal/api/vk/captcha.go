@@ -74,20 +74,20 @@ func parseVkCaptchaError(errData map[string]interface{}) *vkCaptchaError {
 	}
 }
 
-func solveVkCaptcha(ctx context.Context, captchaErr *vkCaptchaError, dialer *dnsdialer.Dialer) (string, error) {
+func solveVkCaptcha(ctx context.Context, captchaErr *vkCaptchaError, dialer *dnsdialer.Dialer, userAgent string) (string, error) {
 	log.Printf("Solving VK Smart Captcha automatically...")
 	if captchaErr.SessionToken == "" {
 		return "", fmt.Errorf("no session_token in redirect_uri")
 	}
 
-	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer)
+	powInput, difficulty, err := fetchPowInput(ctx, captchaErr.RedirectUri, dialer, userAgent)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch PoW input: %w", err)
 	}
 
 	hash := solvePoW(powInput, difficulty)
 
-	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, dialer)
+	successToken, err := callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, dialer, userAgent)
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
 	}
@@ -96,7 +96,7 @@ func solveVkCaptcha(ctx context.Context, captchaErr *vkCaptchaError, dialer *dns
 	return successToken, nil
 }
 
-func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer) (string, int, error) {
+func fetchPowInput(ctx context.Context, redirectUri string, dialer *dnsdialer.Dialer, userAgent string) (string, int, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", redirectUri, nil)
 	if err != nil {
 		return "", 0, err
@@ -153,7 +153,7 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer *dnsdialer.Dialer) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, dialer *dnsdialer.Dialer, userAgent string) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		req, err := http.NewRequestWithContext(ctx, "POST", reqURL, strings.NewReader(postData))
