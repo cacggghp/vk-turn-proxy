@@ -203,7 +203,7 @@ curl -L -o client https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 
 С помощью опции `-turn` можно указать адрес TURN сервера вручную. Это должен быть сервер ВК, Макса или Одноклассников (ссылка вк) или Яндекса (ссылка яндекса). Возможно потом составлю список.
 
-Если не работает TCP, попробуйте добавить флаг `-udp`.
+Если не работает VLESS, попробуйте добавить флаг `-udp`.
 
 Добавьте флаг `-n 1` для более стабильного подключения в 1 поток (ограничение 5 Мбит/с для ВК)
 
@@ -330,29 +330,29 @@ curl -L -o client https://github.com/cacggghp/vk-turn-proxy/releases/latest/down
 
 </details>
 
-## VLESS (TCP-режим)
+## VLESS-режим
 
-Если WireGuard блокируется DPI, можно использовать VLESS через флаг `-tcp`. В этом режиме вместо UDP-пакетов пробрасываются TCP-соединения через TURN-туннель с помощью KCP и smux.
+Если WireGuard блокируется DPI, можно использовать VLESS через флаг `-vless`. В этом режиме вместо UDP-пакетов пробрасываются TCP-соединения через TURN-туннель с помощью KCP и smux.
 
 ### Настройка
 1. На VPS установить Xray с VLESS inbound
-2. Запустить `server` с флагом `-tcp`
-3. На клиенте запустить `client` с флагом `-tcp`
+2. Запустить `server` с флагом `-vless`
+3. На клиенте запустить `client` с флагом `-vless`
 4. Настроить Xray/v2rayN клиент с VLESS outbound на `127.0.0.1:9000`
 
 ### Сервер (VPS)
 ```
-./server -listen 0.0.0.0:56000 -connect 127.0.0.1:443 -tcp
+./server -listen 0.0.0.0:56000 -connect 127.0.0.1:443 -vless
 ```
 
 #### Docker
 ```
-docker run -p 56000:56000/udp -e CONNECT_ADDR=127.0.0.1:443 -e TCP_MODE=true vk-turn-proxy
+docker run -p 56000:56000/udp -e CONNECT_ADDR=127.0.0.1:443 -e VLESS_MODE=true vk-turn-proxy
 ```
 
 ### Клиент
 ```
-./client -peer <ip сервера>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 -tcp
+./client -peer <ip сервера>:56000 -vk-link <VK ссылка> -listen 127.0.0.1:9000 -vless
 ```
 
 <details>
@@ -442,7 +442,6 @@ Xray сервер (config.json)
 
 </details>
 
-> **Важно:** В TCP-режиме используется один TURN-поток. Для VK это ограничивает скорость ~5 Мбит/с.
 
 ## Direct mode
 

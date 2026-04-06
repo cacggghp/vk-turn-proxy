@@ -1366,7 +1366,7 @@ func main() { //nolint:cyclop
 	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
 	udp := flag.Bool("udp", false, "connect to TURN with UDP")
 	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
-	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
+	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	flag.Parse()
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
@@ -1416,8 +1416,8 @@ func main() { //nolint:cyclop
 		getCreds: poolCreds(getCreds, 1),
 	}
 
-	if *tcpMode {
-		runTCPMode(ctx, params, peer, *listen, *n)
+	if *vlessMode {
+		runVLESSMode(ctx, params, peer, *listen, *n)
 		return
 	}
 
@@ -1530,8 +1530,8 @@ func (p *sessionPool) count() int {
 	return len(p.sessions)
 }
 
-// runTCPMode implements TCP forwarding with round-robin across N TURN sessions.
-func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
+// runVLESSMode implements TCP forwarding with round-robin across N TURN sessions.
+func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAddr string, numSessions int) {
 	pool := &sessionPool{}
 
 	// Start N session maintainers with staggered startup
@@ -1545,12 +1545,12 @@ func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAd
 				return
 			case <-time.After(time.Duration(id) * 300 * time.Millisecond):
 			}
-			maintainTCPSession(ctx, tp, peer, id, pool)
+			maintainVLESSSession(ctx, tp, peer, id, pool)
 		}(i)
 	}
 
 	// Wait for at least one session
-	log.Printf("TCP mode: waiting for sessions to connect (total: %d)...", numSessions)
+	log.Printf("VLESS mode: waiting for sessions to connect (total: %d)...", numSessions)
 	for {
 		select {
 		case <-ctx.Done():
@@ -1568,7 +1568,7 @@ func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAd
 		log.Panicf("TCP listen: %s", err)
 	}
 	context.AfterFunc(ctx, func() { _ = listener.Close() })
-	log.Printf("TCP mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
+	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
 
 	var wgConn sync.WaitGroup
 	for {
@@ -1607,8 +1607,8 @@ func runTCPMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listenAd
 	}
 }
 
-// maintainTCPSession keeps one TURN+DTLS+KCP+smux session alive, reconnecting on failure.
-func maintainTCPSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
+// maintainVLESSSession keeps one TURN+DTLS+KCP+smux session alive, reconnecting on failure.
+func maintainVLESSSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, id int, pool *sessionPool) {
 	for {
 		select {
 		case <-ctx.Done():

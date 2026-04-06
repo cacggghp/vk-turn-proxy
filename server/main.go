@@ -23,7 +23,7 @@ import (
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
-	tcpMode := flag.Bool("tcp", false, "TCP mode: forward TCP connections (for VLESS) instead of UDP packets")
+	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	flag.Parse()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -113,8 +113,8 @@ func main() {
 			cancel1()
 			log.Println("Handshake done")
 
-			if *tcpMode {
-				handleTCPConnection(ctx, dtlsConn, *connect)
+			if *vlessMode {
+				handleVLESSConnection(ctx, dtlsConn, *connect)
 			} else {
 				handleUDPConnection(ctx, conn, *connect)
 			}
@@ -212,16 +212,16 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 	wg.Wait()
 }
 
-// handleTCPConnection creates a KCP+smux session over DTLS and forwards
+// handleVLESSConnection creates a KCP+smux session over DTLS and forwards
 // each smux stream as a TCP connection to the backend (Xray/VLESS).
-func handleTCPConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
+func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
 	// 1. Create KCP session over DTLS
 	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, true)
 	if err != nil {
 		log.Printf("KCP session error: %s", err)
 		return
 	}
-	defer func() { _ = kcpSess.Close() }()
+	defer kcpSess.Close()
 	log.Printf("KCP session established (server)")
 
 	// 2. Create smux server session over KCP
@@ -230,7 +230,7 @@ func handleTCPConnection(ctx context.Context, dtlsConn net.Conn, connectAddr str
 		log.Printf("smux server error: %s", err)
 		return
 	}
-	defer func() { _ = smuxSess.Close() }()
+	defer smuxSess.Close()
 	log.Printf("smux session established (server)")
 
 	// 3. Accept smux streams and forward to backend via TCP
@@ -249,7 +249,7 @@ func handleTCPConnection(ctx context.Context, dtlsConn net.Conn, connectAddr str
 		wg.Add(1)
 		go func(s *smux.Stream) {
 			defer wg.Done()
-			defer func() { _ = s.Close() }()
+			defer s.Close()
 
 			// Connect to backend (Xray/VLESS)
 			backendConn, err := net.DialTimeout("tcp", connectAddr, 10*time.Second)
@@ -257,7 +257,7 @@ func handleTCPConnection(ctx context.Context, dtlsConn net.Conn, connectAddr str
 				log.Printf("backend dial error: %s", err)
 				return
 			}
-			defer func() { _ = backendConn.Close() }()
+			defer backendConn.Close()
 
 			// Bidirectional copy
 			pipeConn(ctx, s, backendConn)
