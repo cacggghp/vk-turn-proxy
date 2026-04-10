@@ -1,11 +1,18 @@
 version: "2"
 run:
+  modules-download-mode: readonly
+  relative-path-mode: gomod
   tests: true
 linters:
   enable:
     - bodyclose
+    - errcheck
+    - govet
+    - ineffassign
     - misspell
     - revive
+    - staticcheck
+    - unused
   settings:
     errcheck:
       check-type-assertions: true
@@ -13,12 +20,12 @@ linters:
       exclude-functions:
         - (net.PacketConn).WriteTo
         - (net.Conn).Write
+        - (net.Conn).SetDeadline
         - encoding/json.MarshalIndent
         - (*github.com/pion/dtls/v3.Conn).SetDeadline
     govet:
       disable:
         - fieldalignment
-      enable-all: true
     revive:
       rules:
         - name: blank-imports
@@ -52,10 +59,7 @@ linters:
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - linters:
-        - errcheck
-      source: "doRequest|packetPool\\.Get"
+
 formatters:
   exclusions:
     generated: lax
