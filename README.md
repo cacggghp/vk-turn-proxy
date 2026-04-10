@@ -20,7 +20,7 @@
 - https://github.com/WINGS-N/WINGSV - клиент для андроида с One UI, WireGuard, раздачей VPN с root
 - https://github.com/kiper292/wireguard-turn-android - клиент для андроида интегрированный в WireGuard
 - https://github.com/oxsidee/vkpn - клиент для андроида (кроссплатформенный Flutter)
-- https://github.com/antongospod/turn-proxy-android - клиент для андроида c Material 3 UI и автоапдейтами (Kotlin)
+- https://github.com/samosvalishe/turn-proxy-android - клиент для андроида c Material 3 UI и автоапдейтами (Kotlin)
 - https://github.com/amurcanov/proxy-turn-vk-android - клиент для андроида с WireGuard
 
 #### iOS
