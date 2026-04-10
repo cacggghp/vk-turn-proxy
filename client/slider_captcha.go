@@ -715,12 +715,70 @@ func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderC
 }
 
 func scoreSliderCandidate(img image.Image, gridSize int, mapping []int) (int64, error) {
-	rendered, err := renderSliderCandidate(img, gridSize, mapping)
-	if err != nil {
-		return 0, err
+	bounds := img.Bounds()
+	var score int64
+
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			dstLeftIndex := row*gridSize + col
+			dstRightIndex := row*gridSize + col + 1
+			srcLeftIndex := mapping[dstLeftIndex]
+			srcRightIndex := mapping[dstRightIndex]
+
+			dstLeftRect := sliderTileRect(bounds, gridSize, dstLeftIndex)
+			dstRightRect := sliderTileRect(bounds, gridSize, dstRightIndex)
+			srcLeftRect := sliderTileRect(bounds, gridSize, srcLeftIndex)
+			srcRightRect := sliderTileRect(bounds, gridSize, srcRightIndex)
+
+			height := minInt(dstLeftRect.Dy(), dstRightRect.Dy())
+
+			leftSrcXRel := (dstLeftRect.Dx() - 1) * srcLeftRect.Dx() / dstLeftRect.Dx()
+			sxLeft := srcLeftRect.Min.X + leftSrcXRel
+			sxRight := srcRightRect.Min.X
+
+			for offset := 0; offset < height; offset++ {
+				syLeft := srcLeftRect.Min.Y + offset*srcLeftRect.Dy()/dstLeftRect.Dy()
+				syRight := srcRightRect.Min.Y + offset*srcRightRect.Dy()/dstRightRect.Dy()
+
+				score += pixelDiff(
+					img.At(sxLeft, syLeft),
+					img.At(sxRight, syRight),
+				)
+			}
+		}
 	}
 
-	return scoreRenderedSliderImage(rendered, gridSize), nil
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			dstTopIndex := row*gridSize + col
+			dstBottomIndex := (row+1)*gridSize + col
+			srcTopIndex := mapping[dstTopIndex]
+			srcBottomIndex := mapping[dstBottomIndex]
+
+			dstTopRect := sliderTileRect(bounds, gridSize, dstTopIndex)
+			dstBottomRect := sliderTileRect(bounds, gridSize, dstBottomIndex)
+			srcTopRect := sliderTileRect(bounds, gridSize, srcTopIndex)
+			srcBottomRect := sliderTileRect(bounds, gridSize, srcBottomIndex)
+
+			width := minInt(dstTopRect.Dx(), dstBottomRect.Dx())
+
+			topSrcYRel := (dstTopRect.Dy() - 1) * srcTopRect.Dy() / dstTopRect.Dy()
+			syTop := srcTopRect.Min.Y + topSrcYRel
+			syBottom := srcBottomRect.Min.Y
+
+			for offset := 0; offset < width; offset++ {
+				sxTop := srcTopRect.Min.X + offset*srcTopRect.Dx()/dstTopRect.Dx()
+				sxBottom := srcBottomRect.Min.X + offset*srcBottomRect.Dx()/dstBottomRect.Dx()
+
+				score += pixelDiff(
+					img.At(sxTop, syTop),
+					img.At(sxBottom, syBottom),
+				)
+			}
+		}
+	}
+
+	return score, nil
 }
 
 func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image.RGBA, error) {
@@ -744,40 +802,6 @@ func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image
 	return rendered, nil
 }
 
-func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
-	bounds := img.Bounds()
-	var score int64
-
-	for row := 0; row < gridSize; row++ {
-		for col := 0; col < gridSize-1; col++ {
-			leftRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			rightRect := sliderTileRect(bounds, gridSize, row*gridSize+col+1)
-			height := minInt(leftRect.Dy(), rightRect.Dy())
-			for offset := 0; offset < height; offset++ {
-				score += pixelDiff(
-					img.At(leftRect.Max.X-1, leftRect.Min.Y+offset),
-					img.At(rightRect.Min.X, rightRect.Min.Y+offset),
-				)
-			}
-		}
-	}
-
-	for row := 0; row < gridSize-1; row++ {
-		for col := 0; col < gridSize; col++ {
-			topRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			bottomRect := sliderTileRect(bounds, gridSize, (row+1)*gridSize+col)
-			width := minInt(topRect.Dx(), bottomRect.Dx())
-			for offset := 0; offset < width; offset++ {
-				score += pixelDiff(
-					img.At(topRect.Min.X+offset, topRect.Max.Y-1),
-					img.At(bottomRect.Min.X+offset, bottomRect.Min.Y),
-				)
-			}
-		}
-	}
-
-	return score
-}
 
 func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Rectangle {
 	row := index / gridSize
