@@ -908,11 +908,6 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 
 	var token2 string
 	for attempt := 0; ; attempt++ {
-		solveMode, hasSolveMode := captchaSolveModeForAttempt(attempt, manualCaptcha, autoCaptchaSliderPOC)
-		if !hasSolveMode {
-			break
-		}
-
 		resp, err = doRequest(data, urlAddr)
 		if err != nil {
 			return "", "", "", err
@@ -921,6 +916,21 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		if errObj, hasErr := resp["error"].(map[string]interface{}); hasErr {
 			captchaErr := ParseVkCaptchaError(errObj)
 			if captchaErr != nil && captchaErr.IsCaptchaError() {
+				solveMode, hasSolveMode := captchaSolveModeForAttempt(attempt, manualCaptcha, autoCaptchaSliderPOC)
+				if !hasSolveMode {
+					log.Printf("[STREAM %d] [Captcha] No more solve modes available (attempt %d)", streamID, attempt+1)
+
+					// Engage global lockout to protect API
+					globalCaptchaLockout.Store(time.Now().Add(60 * time.Second).Unix())
+
+					if connectedStreams.Load() == 0 {
+						log.Printf("[STREAM %d] [FATAL] 0 connected streams and captcha solve modes exhausted.", streamID)
+						return "", "", "", fmt.Errorf("FATAL_CAPTCHA_FAILED_NO_STREAMS")
+					}
+
+					return "", "", "", fmt.Errorf("CAPTCHA_WAIT_REQUIRED")
+				}
+
 				var successToken string
 				var captchaKey string
 				var solveErr error
@@ -2192,7 +2202,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		STUNServerAddr:         turnServerAddr,
 		TURNServerAddr:         turnServerAddr,
 		Conn:                   turnConn,
-		Net:                    directNet{},
+		Net:                    newDirectNet(),
 		Username:               user,
 		Password:               pass,
 		RequestedAddressFamily: addrFamily,
