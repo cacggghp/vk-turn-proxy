@@ -153,7 +153,7 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 }
 
 func (s *captchaNotRobotSession) requestCheckboxCheck() (*captchaCheckResult, error) {
-	return s.requestCheck("[]", base64.StdEncoding.EncodeToString([]byte("{}")))
+	return s.requestCheck(generateSliderCursor(0, 1), base64.StdEncoding.EncodeToString([]byte("{}")))
 }
 
 func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*sliderCaptchaContent, error) {
@@ -267,6 +267,22 @@ func callCaptchaNotRobotWithSliderPOC(
 
 	sliderContent, err := session.requestSliderContent(sliderSettings)
 	if err != nil {
+		log.Printf(
+			"[STREAM %d] [Captcha] Slider getContent failed (status: %v). Trying to solve as a checkbox instead...",
+			streamID,
+			err,
+		)
+		// Fallback: maybe it's just a checkbox that needs a human-like check
+		time.Sleep(300 * time.Millisecond)
+		finalCheck, err2 := session.requestCheckboxCheck()
+		if err2 == nil && finalCheck.Status == "OK" {
+			if finalCheck.SuccessToken == "" {
+				return "", fmt.Errorf("success_token not found in fallback check")
+			}
+			log.Printf("[STREAM %d] [Captcha] Fallback checkbox check succeeded!", streamID)
+			session.requestEndSession()
+			return finalCheck.SuccessToken, nil
+		}
 		return "", fmt.Errorf("check status: %s (slider getContent failed: %w)", initialCheck.Status, err)
 	}
 

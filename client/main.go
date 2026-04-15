@@ -228,7 +228,7 @@ func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
 }
 
 func generateBrowserFp(profile Profile) string {
-	data := profile.UserAgent + profile.SecChUa + "1920x1080x24"
+	data := profile.UserAgent + profile.SecChUa + "1920x1080x24" + strconv.FormatInt(time.Now().UnixNano(), 10)
 	h := md5.Sum([]byte(data))
 	return hex.EncodeToString(h[:])
 }
