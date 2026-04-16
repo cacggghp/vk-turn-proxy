@@ -1,7 +1,7 @@
 name: "Close Stale Issues"
 on:
   schedule:
-    - cron: "0 0 * * 3"
+    - cron: "0 0 * * 0"
   workflow_dispatch:
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
             <br><br>
             Спасибо!
           close-issue-message: "Issue был закрыт из-за отсутствия активности."
-          days-before-stale: 120
+          days-before-stale: 30
           days-before-close: 7
           operations-per-run: 1000
           ascending: true
