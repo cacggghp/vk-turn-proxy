@@ -144,7 +144,7 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 
 	respObj, ok := resp["response"].(map[string]interface{})
 	if ok {
-		if status, _ := respObj["status"].(string); status != "" && status != "OK" {
+		if status, ok := respObj["status"].(string); ok && status != "" && status != "OK" {
 			return fmt.Errorf("componentDone status: %s", status)
 		}
 	}
@@ -332,7 +332,9 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 	settings := &captchaSettingsResponse{
 		SettingsByType: make(map[string]string),
 	}
-	settings.ShowCaptchaType, _ = respObj["show_captcha_type"].(string)
+	if showCaptchaType, ok := respObj["show_captcha_type"].(string); ok {
+		settings.ShowCaptchaType = showCaptchaType
+	}
 
 	rawSettings, ok := expandCaptchaSettings(respObj["captcha_settings"])
 	if !ok {
@@ -345,8 +347,8 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 			continue
 		}
 
-		captchaType, _ := item["type"].(string)
-		if captchaType == "" {
+		captchaType, ok := item["type"].(string)
+		if !ok || captchaType == "" {
 			continue
 		}
 
@@ -511,9 +513,15 @@ func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, 
 	}
 
 	result := &captchaCheckResult{}
-	result.Status, _ = respObj["status"].(string)
-	result.SuccessToken, _ = respObj["success_token"].(string)
-	result.ShowCaptchaType, _ = respObj["show_captcha_type"].(string)
+	if status, ok := respObj["status"].(string); ok {
+		result.Status = status
+	}
+	if successToken, ok := respObj["success_token"].(string); ok {
+		result.SuccessToken = successToken
+	}
+	if showCaptchaType, ok := respObj["show_captcha_type"].(string); ok {
+		result.ShowCaptchaType = showCaptchaType
+	}
 	if result.Status == "" {
 		return nil, fmt.Errorf("check status missing: %v", resp)
 	}
@@ -527,19 +535,22 @@ func parseSliderCaptchaContentResponse(resp map[string]interface{}) (*sliderCapt
 		return nil, fmt.Errorf("invalid slider content response: %v", resp)
 	}
 
-	status, _ := respObj["status"].(string)
-	if status != "OK" {
+	status, ok := respObj["status"].(string)
+	if !ok || status != "OK" {
 		return nil, fmt.Errorf("slider getContent status: %s", status)
 	}
 
-	extension, _ := respObj["extension"].(string)
+	extension, ok := respObj["extension"].(string)
+	if !ok {
+		return nil, fmt.Errorf("unsupported slider image format: %v", respObj["extension"])
+	}
 	extension = strings.ToLower(extension)
 	if extension != "jpeg" && extension != "jpg" {
 		return nil, fmt.Errorf("unsupported slider image format: %s", extension)
 	}
 
-	rawImage, _ := respObj["image"].(string)
-	if rawImage == "" {
+	rawImage, ok := respObj["image"].(string)
+	if !ok || rawImage == "" {
 		return nil, fmt.Errorf("slider image missing")
 	}
 

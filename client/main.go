@@ -11,6 +11,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,18 +22,21 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	fhttp "github.com/bogdanfinn/fhttp"
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
 	"github.com/bschaatsbergen/dnsdialer"
+	"github.com/cacggghp/vk-turn-proxy/internal/cliutil"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -62,6 +66,7 @@ var (
 	activeLocalPeer      atomic.Value
 	globalCaptchaLockout atomic.Int64
 	connectedStreams     atomic.Int32
+	configuredStreams    atomic.Int32
 	globalAppCancel      context.CancelFunc
 	handshakeSem         = make(chan struct{}, 3)
 	isDebug              bool
@@ -70,12 +75,69 @@ var (
 )
 
 type captchaSolveMode int
+type captchaFailureCountContextKey struct{}
 
 const (
 	captchaSolveModeAuto captchaSolveMode = iota
 	captchaSolveModeSliderPOC
 	captchaSolveModeManual
 )
+
+type clientOptions struct {
+	host          string
+	port          string
+	listen        string
+	vklink        string
+	yalink        string
+	peerAddr      string
+	n             int
+	udp           bool
+	direct        bool
+	vlessMode     bool
+	debug         bool
+	manualCaptcha bool
+}
+
+func newClientFlagSet(program string, output io.Writer) (*flag.FlagSet, *clientOptions) {
+	fs := flag.NewFlagSet(program, flag.ContinueOnError)
+	fs.SetOutput(output)
+
+	opts := &clientOptions{}
+	fs.StringVar(&opts.host, "turn", "", "override TURN server ip")
+	fs.StringVar(&opts.port, "port", "", "override TURN port")
+	fs.StringVar(&opts.listen, "listen", "127.0.0.1:9000", "listen on ip:port")
+	fs.StringVar(&opts.vklink, "vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
+	fs.StringVar(&opts.yalink, "yandex-link", "", "Yandex Telemost invite link \"https://telemost.yandex.ru/j/...\"")
+	fs.StringVar(&opts.peerAddr, "peer", "", "peer server address (host:port)")
+	fs.IntVar(&opts.n, "n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
+	fs.BoolVar(&opts.udp, "udp", false, "connect to TURN with UDP")
+	fs.BoolVar(&opts.direct, "no-dtls", false, "connect without obfuscation. DO NOT USE")
+	fs.BoolVar(&opts.vlessMode, "vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	fs.BoolVar(&opts.debug, "debug", false, "enable debug logging")
+	fs.BoolVar(&opts.manualCaptcha, "manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+	fs.Usage = func() {
+		cliutil.Fprintf(fs.Output(), "Usage:\n  %s -peer <host:port> -vk-link <link> [flags]\n  %s -peer <host:port> -yandex-link <link> [flags]\n\n", program, program)
+		cliutil.Fprintln(fs.Output(), "Examples:")
+		cliutil.Fprintf(fs.Output(), "  %s -listen 127.0.0.1:9000 -peer 203.0.113.10:56000 -vk-link https://vk.com/call/join/...\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -udp -turn 5.255.211.241 -peer 203.0.113.10:56000 -yandex-link https://telemost.yandex.ru/j/... -listen 127.0.0.1:9000\n\n", program)
+		cliutil.Fprintln(fs.Output(), "Flags:")
+		fs.PrintDefaults()
+	}
+
+	return fs, opts
+}
+
+func parseClientOptions(args []string, program string, stdout, stderr io.Writer) (clientOptions, int) {
+	return cliutil.Parse(args, program, stdout, stderr, newClientFlagSet, func(opts *clientOptions) error {
+		if opts.peerAddr == "" {
+			return fmt.Errorf("-peer is required")
+		}
+		if (opts.vklink == "") == (opts.yalink == "") {
+			return fmt.Errorf("exactly one of -vk-link or -yandex-link is required")
+		}
+		return nil
+	})
+}
 
 func captchaSolveModeForAttempt(attempt int, manualOnly bool, enableSliderPOC bool) (captchaSolveMode, bool) {
 	if manualOnly {
@@ -110,6 +172,35 @@ func captchaSolveModeLabel(mode captchaSolveMode) string {
 	default:
 		return "captcha"
 	}
+}
+
+func withCaptchaFailureCount(ctx context.Context, count int) context.Context {
+	if count <= 0 {
+		return ctx
+	}
+	return context.WithValue(ctx, captchaFailureCountContextKey{}, count)
+}
+
+func captchaFailureCountFromContext(ctx context.Context) int {
+	if ctx == nil {
+		return 0
+	}
+	count, ok := ctx.Value(captchaFailureCountContextKey{}).(int)
+	if !ok {
+		return 0
+	}
+	return count
+}
+
+func captchaLogAttempt(ctx context.Context, solveMode captchaSolveMode, attempt int) int {
+	displayAttempt := attempt + 1
+	if solveMode == captchaSolveModeManual {
+		bucketAttempt := captchaFailureCountFromContext(ctx) + 1
+		if bucketAttempt > displayAttempt {
+			displayAttempt = bucketAttempt
+		}
+	}
+	return displayAttempt
 }
 
 type UDPPacket struct {
@@ -611,22 +702,69 @@ type TurnCredentials struct {
 }
 
 type StreamCredentialsCache struct {
-	creds         TurnCredentials
-	mutex         sync.RWMutex
-	errorCount    atomic.Int32
-	lastErrorTime atomic.Int64
+	creds            TurnCredentials
+	mutex            sync.RWMutex
+	errorCount       atomic.Int32
+	lastErrorTime    atomic.Int64
+	captchaFailures  int
+	disabled         bool
+	disableAnnounced bool
+	retryAfter       time.Time
+	retryErr         error
+	retryLink        string
 }
 
 const (
 	credentialLifetime = 10 * time.Minute
 	cacheSafetyMargin  = 60 * time.Second
 	maxCacheErrors     = 3
+	maxCaptchaFailures = 2
 	errorWindow        = 10 * time.Second
 	streamsPerCache    = 10
+	cacheRetryDelay    = 60 * time.Second
 )
+
+var errCaptchaBucketDisabled = errors.New("CAPTCHA_BUCKET_DISABLED")
 
 func getCacheID(streamID int) int {
 	return streamID / streamsPerCache
+}
+
+func bucketStreamCount(cacheID int, numStreams int) int {
+	start := cacheID * streamsPerCache
+	if start >= numStreams {
+		return 0
+	}
+	end := start + streamsPerCache
+	if end > numStreams {
+		end = numStreams
+	}
+	return end - start
+}
+
+func activeConfiguredStreamCount() int {
+	numStreams := int(configuredStreams.Load())
+	if numStreams <= 0 {
+		return 0
+	}
+
+	disabledStreams := 0
+	credentialsStore.mu.RLock()
+	defer credentialsStore.mu.RUnlock()
+	for cacheID, cache := range credentialsStore.caches {
+		cache.mutex.RLock()
+		disabled := cache.disabled
+		cache.mutex.RUnlock()
+		if disabled {
+			disabledStreams += bucketStreamCount(cacheID, numStreams)
+		}
+	}
+
+	activeStreams := numStreams - disabledStreams
+	if activeStreams < 0 {
+		return 0
+	}
+	return activeStreams
 }
 
 func vkDelayRandom(minMs, maxMs int) {
@@ -702,12 +840,45 @@ func handleAuthError(streamID int) bool {
 func (c *StreamCredentialsCache) invalidate(streamID int) {
 	c.mutex.Lock()
 	c.creds = TurnCredentials{}
+	c.captchaFailures = 0
+	c.disabled = false
+	c.disableAnnounced = false
+	c.retryAfter = time.Time{}
+	c.retryErr = nil
+	c.retryLink = ""
 	c.mutex.Unlock()
 
 	c.errorCount.Store(0)
 	c.lastErrorTime.Store(0)
 
 	log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
+}
+
+func isCacheBucketDisabled(streamID int) bool {
+	cache := getStreamCache(streamID)
+	cache.mutex.RLock()
+	defer cache.mutex.RUnlock()
+	return cache.disabled
+}
+
+func announceDisabledBucket(streamID int) {
+	cache := getStreamCache(streamID)
+	cacheID := getCacheID(streamID)
+
+	cache.mutex.Lock()
+	if cache.disableAnnounced {
+		cache.mutex.Unlock()
+		return
+	}
+	cache.disableAnnounced = true
+	cache.mutex.Unlock()
+
+	log.Printf(
+		"[VK Auth] Cache bucket %d disabled after %d captcha failures. Continuing with %d streams.",
+		cacheID,
+		maxCaptchaFailures,
+		activeConfiguredStreamCount(),
+	)
 }
 
 func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
@@ -733,19 +904,48 @@ func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dn
 	if cache.creds.Link == link && time.Now().Before(cache.creds.ExpiresAt) {
 		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddr, nil
 	}
+	if cache.disabled {
+		return "", "", "", fmt.Errorf("%w: cache=%d", errCaptchaBucketDisabled, cacheID)
+	}
+	if cache.retryErr != nil && cache.retryLink == link && time.Now().Before(cache.retryAfter) {
+		if isDebug {
+			log.Printf("[STREAM %d] [VK Auth] Reusing cache=%d captcha cooldown (%v remaining)", streamID, cacheID, time.Until(cache.retryAfter).Truncate(time.Millisecond))
+		}
+		return "", "", "", cache.retryErr
+	}
 
-	user, pass, addr, err := fetchVkCredsSerialized(ctx, link, streamID, dialer)
+	user, pass, addr, err := fetchVkCredsSerializedFunc(withCaptchaFailureCount(ctx, cache.captchaFailures), link, streamID, dialer)
 	if err != nil {
+		if strings.Contains(err.Error(), "CAPTCHA_WAIT_REQUIRED") {
+			cache.captchaFailures++
+			cache.retryAfter = time.Now().Add(cacheRetryDelay)
+			cache.retryErr = err
+			cache.retryLink = link
+			if cache.captchaFailures >= maxCaptchaFailures {
+				cache.disabled = true
+				cache.retryAfter = time.Time{}
+				cache.retryErr = nil
+				cache.retryLink = ""
+				return "", "", "", fmt.Errorf("%w: cache=%d", errCaptchaBucketDisabled, cacheID)
+			}
+		}
 		return "", "", "", err
 	}
 
+	cache.captchaFailures = 0
+	cache.disabled = false
+	cache.disableAnnounced = false
+	cache.retryAfter = time.Time{}
+	cache.retryErr = nil
+	cache.retryLink = ""
 	cache.creds = TurnCredentials{Username: user, Password: pass, ServerAddr: addr, ExpiresAt: time.Now().Add(credentialLifetime - cacheSafetyMargin), Link: link}
 	return user, pass, addr, nil
 }
 
 var (
-	vkRequestMu           sync.Mutex
-	globalLastVkFetchTime time.Time
+	fetchVkCredsSerializedFunc = fetchVkCredsSerialized
+	vkRequestMu                sync.Mutex
+	globalLastVkFetchTime      time.Time
 )
 
 func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
@@ -958,40 +1158,23 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
 					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
 
-					type manualRes struct {
-						token string
-						key   string
-						err   error
+					if captchaErr.RedirectURI != "" {
+						successToken, solveErr = solveCaptchaViaProxy(manualCtx, captchaErr.RedirectURI, dialer)
+					} else if captchaErr.CaptchaImg != "" {
+						captchaKey, solveErr = solveCaptchaViaHTTP(manualCtx, captchaErr.CaptchaImg)
+					} else {
+						solveErr = fmt.Errorf("no redirect_uri or captcha_img")
 					}
-					resCh := make(chan manualRes, 1)
-
-					go func() {
-						var t, k string
-						var e error
-						if captchaErr.RedirectURI != "" {
-							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer)
-						} else if captchaErr.CaptchaImg != "" {
-							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
-						} else {
-							e = fmt.Errorf("no redirect_uri or captcha_img")
-						}
-						resCh <- manualRes{t, k, e}
-					}()
-
-					select {
-					case res := <-resCh:
-						successToken = res.token
-						captchaKey = res.key
-						solveErr = res.err
-					case <-manualCtx.Done():
+					deadlineExceeded := errors.Is(manualCtx.Err(), context.DeadlineExceeded)
+					manualCancel()
+					if solveErr != nil && deadlineExceeded {
 						solveErr = fmt.Errorf("manual captcha timed out after 60s")
 					}
-					manualCancel()
 				}
 
 				// If solving failed (auto or manual) or timed out
 				if solveErr != nil {
-					log.Printf("[STREAM %d] [Captcha] %s failed (attempt %d): %v", streamID, captchaSolveModeLabel(solveMode), attempt+1, solveErr)
+					log.Printf("[STREAM %d] [Captcha] %s failed (attempt %d): %v", streamID, capitalizeFirstLetter(captchaSolveModeLabel(solveMode)), captchaLogAttempt(ctx, solveMode, attempt), solveErr)
 
 					nextSolveMode, hasNextSolveMode := captchaSolveModeForAttempt(attempt+1, manualCaptcha, autoCaptchaSliderPOC)
 					if hasNextSolveMode {
@@ -1424,6 +1607,7 @@ func dtlsFunc(ctx context.Context, conn net.PacketConn, peer *net.UDPAddr) (net.
 	}
 
 	if err := dtlsConn.HandshakeContext(ctx1); err != nil {
+		_ = dtlsConn.Close()
 		return nil, err
 	}
 	return dtlsConn, nil
@@ -1436,6 +1620,15 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 	defer dtlscancel()
 
 	conn1, conn2 := connutil.AsyncPacketPipe()
+	pipeConn := conn1
+	defer func() {
+		if pipeConn == nil {
+			return
+		}
+		if closeErr := pipeConn.Close(); closeErr != nil {
+			log.Printf("[STREAM %d] Failed to close DTLS pipe: %s", streamID, closeErr)
+		}
+	}()
 	go func() {
 		for {
 			select {
@@ -1449,6 +1642,7 @@ func oneDtlsConnection(ctx context.Context, peer *net.UDPAddr, listenConn net.Pa
 	if err1 != nil {
 		return fmt.Errorf("failed to connect DTLS: %s", err1)
 	}
+	pipeConn = nil
 	defer func() {
 		if closeErr := dtlsConn.Close(); closeErr != nil {
 			log.Printf("[STREAM %d] failed to close DTLS connection: %s", streamID, closeErr)
@@ -1713,6 +1907,10 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 func oneDtlsConnectionLoop(ctx context.Context, peer *net.UDPAddr, listenConn net.PacketConn, inboundChan <-chan *UDPPacket, connchan chan<- net.PacketConn, okchan chan<- struct{}, streamID int) {
 	for {
+		if isCacheBucketDisabled(streamID) {
+			announceDisabledBucket(streamID)
+			return
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -1747,6 +1945,10 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 			go oneTurnConnection(ctx, turnParams, peer, conn2, streamID, c)
 
 			if err := <-c; err != nil {
+				if strings.Contains(err.Error(), errCaptchaBucketDisabled.Error()) {
+					announceDisabledBucket(streamID)
+					return
+				}
 				if strings.Contains(err.Error(), "FATAL_CAPTCHA") {
 					log.Printf("[STREAM %d] Fatal manual captcha error. Shutting down application.", streamID)
 					if globalAppCancel != nil {
@@ -1784,6 +1986,11 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 }
 
 func main() {
+	opts, exitCode := parseClientOptions(os.Args[1:], filepath.Base(os.Args[0]), os.Stdout, os.Stderr)
+	if exitCode != cliutil.ContinueExecution {
+		os.Exit(exitCode)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	globalAppCancel = cancel
 	defer cancel()
@@ -1800,38 +2007,19 @@ func main() {
 		log.Fatalf("Exit...\n")
 	}()
 
-	host := flag.String("turn", "", "override TURN server ip")
-	port := flag.String("port", "", "override TURN port")
-	listen := flag.String("listen", "127.0.0.1:9000", "listen on ip:port")
-	vklink := flag.String("vk-link", "", "VK calls invite link \"https://vk.com/call/join/...\"")
-	yalink := flag.String("yandex-link", "", "Yandex telemost invite link \"https://telemost.yandex.ru/j/...\"")
-	peerAddr := flag.String("peer", "", "peer server address (host:port)")
-	n := flag.Int("n", 0, "connections to TURN (default 10 for VK, 1 for Yandex)")
-	udp := flag.Bool("udp", false, "connect to TURN with UDP")
-	direct := flag.Bool("no-dtls", false, "connect without obfuscation. DO NOT USE")
-	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	debugFlag := flag.Bool("debug", false, "enable debug logging")
-	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
-	flag.Parse()
-	if *peerAddr == "" {
-		log.Panicf("Need peer address!")
-	}
-	peer, err := net.ResolveUDPAddr("udp", *peerAddr)
+	peer, err := net.ResolveUDPAddr("udp", opts.peerAddr)
 	if err != nil {
 		panic(err)
 	}
-	if (*vklink == "") == (*yalink == "") {
-		log.Panicf("Need either vk-link or yandex-link!")
-	}
 
-	isDebug = *debugFlag
-	manualCaptcha = *manualCaptchaFlag
+	isDebug = opts.debug
+	manualCaptcha = opts.manualCaptcha
 	autoCaptchaSliderPOC = !manualCaptcha
 
 	var link string
 	var getCreds getCredsFunc
-	if *vklink != "" {
-		parts := strings.Split(*vklink, "join/")
+	if opts.vklink != "" {
+		parts := strings.Split(opts.vklink, "join/")
 		link = parts[len(parts)-1]
 
 		dialer := dnsdialer.New(
@@ -1843,17 +2031,17 @@ func main() {
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
 			return getVkCredsCached(ctx, s, streamID, dialer)
 		}
-		if *n <= 0 {
-			*n = 10
+		if opts.n <= 0 {
+			opts.n = 10
 		}
 	} else {
-		parts := strings.Split(*yalink, "j/")
+		parts := strings.Split(opts.yalink, "j/")
 		link = parts[len(parts)-1]
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
 			return getYandexCreds(s)
 		}
-		if *n <= 0 {
-			*n = 1
+		if opts.n <= 0 {
+			opts.n = 1
 		}
 	}
 	if idx := strings.IndexAny(link, "/?#"); idx != -1 {
@@ -1861,19 +2049,19 @@ func main() {
 	}
 
 	params := &turnParams{
-		host:     *host,
-		port:     *port,
+		host:     opts.host,
+		port:     opts.port,
 		link:     link,
-		udp:      *udp,
+		udp:      opts.udp,
 		getCreds: getCreds,
 	}
 
-	if *vlessMode {
-		runVLESSMode(ctx, params, peer, *listen, *n)
+	if opts.vlessMode {
+		runVLESSMode(ctx, params, peer, opts.listen, opts.n)
 		return
 	}
 
-	listenConn, err := net.ListenPacket("udp", *listen)
+	listenConn, err := net.ListenPacket("udp", opts.listen)
 	if err != nil {
 		log.Panicf("Failed to listen: %s", err)
 	}
@@ -1883,10 +2071,11 @@ func main() {
 		}
 	})
 
-	numStreams := *n
+	numStreams := opts.n
 	if numStreams <= 0 {
 		numStreams = 1
 	}
+	configuredStreams.Store(int32(numStreams))
 
 	// Shared Worker Pool Queue for Aggregation
 	inboundChan := make(chan *UDPPacket, 2000)
@@ -1930,21 +2119,24 @@ func main() {
 	wg1 := sync.WaitGroup{}
 	t := time.Tick(200 * time.Millisecond)
 
-	if *direct {
+	if opts.direct {
 		log.Panicf("Direct mode not supported with dispatcher")
 	}
 
 	okchan := make(chan struct{})
 	connchan := make(chan net.PacketConn)
+	streamCtx, streamCancel := context.WithCancel(ctx)
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, connchan, okchan, 1)
+		defer streamCancel()
+		oneDtlsConnectionLoop(streamCtx, peer, listenConn, inboundChan, connchan, okchan, 1)
 	}()
 	wg1.Add(1)
 	go func() {
 		defer wg1.Done()
-		oneTurnConnectionLoop(ctx, params, peer, connchan, t, 1)
+		defer streamCancel()
+		oneTurnConnectionLoop(streamCtx, params, peer, connchan, t, 1)
 	}()
 
 	select {
@@ -1954,15 +2146,18 @@ func main() {
 
 	for i := 1; i < numStreams; i++ {
 		cchan := make(chan net.PacketConn)
+		streamCtx, streamCancel := context.WithCancel(ctx)
 		wg1.Add(1)
 		go func(streamID int) {
 			defer wg1.Done()
-			oneDtlsConnectionLoop(ctx, peer, listenConn, inboundChan, cchan, nil, streamID)
+			defer streamCancel()
+			oneDtlsConnectionLoop(streamCtx, peer, listenConn, inboundChan, cchan, nil, streamID)
 		}(i)
 		wg1.Add(1)
 		go func(streamID int) {
 			defer wg1.Done()
-			oneTurnConnectionLoop(ctx, params, peer, cchan, t, streamID)
+			defer streamCancel()
+			oneTurnConnectionLoop(streamCtx, params, peer, cchan, t, streamID)
 		}(i)
 	}
 
@@ -2246,16 +2441,19 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("DTLS handshake: %w", err)
 	}
-	cleanupFns = append(cleanupFns, func() { _ = dtlsConn.Close() })
 	log.Printf("DTLS connection established")
 
 	// 5. Create KCP session over DTLS
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
+	kcpSess, cleanupKCP, err := tcputil.NewKCPOverDTLS(dtlsConn, false)
 	if err != nil {
 		cleanup()
 		return nil, nil, fmt.Errorf("KCP session: %w", err)
 	}
-	cleanupFns = append(cleanupFns, func() { _ = kcpSess.Close() })
+	cleanupFns = append(cleanupFns, func() {
+		if err := cleanupKCP(); err != nil {
+			log.Printf("KCP cleanup error: %v", err)
+		}
+	})
 	log.Printf("KCP session established")
 
 	// 6. Create smux client session over KCP
@@ -2325,4 +2523,11 @@ func pipe(ctx context.Context, c1, c2 net.Conn) {
 	if err := c2.SetDeadline(time.Time{}); err != nil {
 		log.Printf("pipe: failed to reset deadline c2: %v", err)
 	}
+}
+
+func capitalizeFirstLetter(s string) string {
+	for i, v := range s {
+		return string(unicode.ToUpper(v)) + s[i+len(string(v)):]
+	}
+	return ""
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -9,21 +10,58 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/cacggghp/vk-turn-proxy/internal/cliutil"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	"github.com/xtaci/smux"
 )
 
+type serverOptions struct {
+	listen    string
+	connect   string
+	vlessMode bool
+}
+
+func newServerFlagSet(program string, output io.Writer) (*flag.FlagSet, *serverOptions) {
+	fs := flag.NewFlagSet(program, flag.ContinueOnError)
+	fs.SetOutput(output)
+
+	opts := &serverOptions{}
+	fs.StringVar(&opts.listen, "listen", "0.0.0.0:56000", "listen on ip:port")
+	fs.StringVar(&opts.connect, "connect", "", "connect to ip:port")
+	fs.BoolVar(&opts.vlessMode, "vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	fs.Usage = func() {
+		cliutil.Fprintf(fs.Output(), "Usage:\n  %s -connect <ip:port> [flags]\n\n", program)
+		cliutil.Fprintln(fs.Output(), "Examples:")
+		cliutil.Fprintf(fs.Output(), "  %s -connect 127.0.0.1:51820\n", program)
+		cliutil.Fprintf(fs.Output(), "  %s -listen 0.0.0.0:56000 -connect 127.0.0.1:51820 -vless\n\n", program)
+		cliutil.Fprintln(fs.Output(), "Flags:")
+		fs.PrintDefaults()
+	}
+
+	return fs, opts
+}
+
+func parseServerOptions(args []string, program string, stdout, stderr io.Writer) (serverOptions, int) {
+	return cliutil.Parse(args, program, stdout, stderr, newServerFlagSet, func(opts *serverOptions) error {
+		if opts.connect == "" {
+			return fmt.Errorf("-connect is required")
+		}
+		return nil
+	})
+}
+
 func main() {
-	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
-	connect := flag.String("connect", "", "connect to ip:port")
-	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
-	flag.Parse()
+	opts, exitCode := parseServerOptions(os.Args[1:], filepath.Base(os.Args[0]), os.Stdout, os.Stderr)
+	if exitCode != cliutil.ContinueExecution {
+		os.Exit(exitCode)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,22 +75,15 @@ func main() {
 		log.Fatalf("Exit...\n")
 	}()
 
-	addr, err := net.ResolveUDPAddr("udp", *listen)
+	addr, err := net.ResolveUDPAddr("udp", opts.listen)
 	if err != nil {
 		panic(err)
-	}
-	if len(*connect) == 0 {
-		log.Panicf("server address is required")
 	}
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
 		panic(genErr)
 	}
-
-	//
-	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
-	//
 
 	// Connect to a DTLS server
 	listener, err := dtls.ListenWithOptions(
@@ -72,7 +103,7 @@ func main() {
 		}
 	})
 
-	fmt.Println("Listening")
+	cliutil.Fprintln(os.Stdout, "Listening")
 
 	wg1 := sync.WaitGroup{}
 	for {
@@ -91,7 +122,11 @@ func main() {
 		wg1.Add(1)
 		go func(conn net.Conn) {
 			defer wg1.Done()
+			closeConn := true
 			defer func() {
+				if !closeConn {
+					return
+				}
 				if closeErr := conn.Close(); closeErr != nil {
 					log.Printf("failed to close incoming connection: %s", closeErr)
 				}
@@ -114,10 +149,11 @@ func main() {
 			}
 			log.Println("Handshake done")
 
-			if *vlessMode {
-				handleVLESSConnection(ctx, dtlsConn, *connect)
+			if opts.vlessMode {
+				closeConn = false
+				handleVLESSConnection(ctx, dtlsConn, opts.connect)
 			} else {
-				handleUDPConnection(ctx, conn, *connect)
+				handleUDPConnection(ctx, conn, opts.connect)
 			}
 
 			log.Printf("Connection closed: %s\n", conn.RemoteAddr())
@@ -149,83 +185,24 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 			log.Printf("failed to set outgoing deadline: %s", err)
 		}
 	})
-	go func() {
-		defer wg.Done()
-		defer cancel2()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-ctx2.Done():
-				return
-			default:
-			}
-			if err1 := conn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-			n, err1 := conn.Read(buf)
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-
-			if err1 = serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-			_, err1 = serverConn.Write(buf[:n])
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		defer cancel2()
-		buf := make([]byte, 1600)
-		for {
-			select {
-			case <-ctx2.Done():
-				return
-			default:
-			}
-			if err1 := serverConn.SetReadDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-			n, err1 := serverConn.Read(buf)
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-
-			if err1 = conn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-			_, err1 = conn.Write(buf[:n])
-			if err1 != nil {
-				log.Printf("Failed: %s", err1)
-				return
-			}
-		}
-	}()
+	startPacketForwarder(ctx2, &wg, cancel2, conn, serverConn)
+	startPacketForwarder(ctx2, &wg, cancel2, serverConn, conn)
 	wg.Wait()
 }
 
 // handleVLESSConnection creates a KCP+smux session over DTLS and forwards
 // each smux stream as a TCP connection to the backend (Xray/VLESS).
+// It takes ownership of dtlsConn and closes it through the KCP cleanup path.
 func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr string) {
 	// 1. Create KCP session over DTLS
-	kcpSess, err := tcputil.NewKCPOverDTLS(dtlsConn, true)
+	kcpSess, cleanupKCP, err := tcputil.NewKCPOverDTLS(dtlsConn, true)
 	if err != nil {
 		log.Printf("KCP session error: %s", err)
 		return
 	}
 	defer func() {
-		if err := kcpSess.Close(); err != nil {
-			log.Printf("failed to close KCP session: %v", err)
+		if err := cleanupKCP(); err != nil {
+			log.Printf("failed to close KCP-over-DTLS transport: %v", err)
 		}
 	}()
 	log.Printf("KCP session established (server)")
@@ -261,7 +238,7 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 			defer wg.Done()
 
 			defer func() {
-				if err := s.Close(); err != nil && err != smux.ErrGoAway {
+				if err := s.Close(); err != nil && !errors.Is(err, smux.ErrGoAway) {
 					log.Printf("failed to close smux stream: %v", err)
 				}
 			}()
@@ -301,24 +278,58 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(c1, c2); err != nil {
-			log.Printf("pipeConn: c1<-c2 copy error: %v", err)
-		}
-	}()
-
-	go func() {
-		defer wg.Done()
-		if _, err := io.Copy(c2, c1); err != nil {
-			log.Printf("pipeConn: c2<-c1 copy error: %v", err)
-		}
-	}()
+	startStreamCopy(&wg, cancel, c1, c2, "pipeConn: c1<-c2")
+	startStreamCopy(&wg, cancel, c2, c1, "pipeConn: c2<-c1")
 
 	wg.Wait()
 
 	// Reset deadlines
 	_ = c1.SetDeadline(time.Time{})
 	_ = c2.SetDeadline(time.Time{})
+}
+
+func startPacketForwarder(ctx context.Context, wg *sync.WaitGroup, cancel context.CancelFunc, src, dst net.Conn) {
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		buf := make([]byte, 1600)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if err := src.SetReadDeadline(time.Now().Add(30 * time.Minute)); err != nil {
+				log.Printf("Failed: %s", err)
+				return
+			}
+			n, err := src.Read(buf)
+			if err != nil {
+				log.Printf("Failed: %s", err)
+				return
+			}
+
+			if err = dst.SetWriteDeadline(time.Now().Add(30 * time.Minute)); err != nil {
+				log.Printf("Failed: %s", err)
+				return
+			}
+			if _, err = dst.Write(buf[:n]); err != nil {
+				log.Printf("Failed: %s", err)
+				return
+			}
+		}
+	}()
+}
+
+func startStreamCopy(wg *sync.WaitGroup, cancel context.CancelFunc, dst, src net.Conn, label string) {
+	go func() {
+		defer wg.Done()
+		defer cancel()
+
+		if _, err := io.Copy(dst, src); err != nil {
+			log.Printf("%s copy error: %v", label, err)
+		}
+	}()
 }

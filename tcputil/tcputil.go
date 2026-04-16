@@ -1,83 +1,117 @@
 package tcputil
 
 import (
+	"errors"
+	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 )
 
-// DtlsPacketConn wraps a net.Conn (DTLS) as a net.PacketConn for KCP.
-// Each DTLS Read/Write preserves message boundaries (datagram semantics).
-type DtlsPacketConn struct {
+// dtlsPacketConn adapts a DTLS net.Conn to net.PacketConn for KCP.
+// It does not own the underlying transport; callers must close dtlsConn
+// through the cleanup function returned by NewKCPOverDTLS.
+type dtlsPacketConn struct {
 	conn net.Conn
 }
 
-func NewDtlsPacketConn(conn net.Conn) *DtlsPacketConn {
-	return &DtlsPacketConn{conn: conn}
-}
-
-func (d *DtlsPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+func (d *dtlsPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, err := d.conn.Read(b)
 	return n, d.conn.RemoteAddr(), err
 }
 
-func (d *DtlsPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+func (d *dtlsPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
 	return d.conn.Write(b)
 }
 
-func (d *DtlsPacketConn) Close() error {
-	return d.conn.Close()
+func (d *dtlsPacketConn) Close() error {
+	return nil
 }
 
-func (d *DtlsPacketConn) LocalAddr() net.Addr {
+func (d *dtlsPacketConn) LocalAddr() net.Addr {
 	return d.conn.LocalAddr()
 }
 
-func (d *DtlsPacketConn) SetDeadline(t time.Time) error {
+func (d *dtlsPacketConn) SetDeadline(t time.Time) error {
 	return d.conn.SetDeadline(t)
 }
 
-func (d *DtlsPacketConn) SetReadDeadline(t time.Time) error {
+func (d *dtlsPacketConn) SetReadDeadline(t time.Time) error {
 	return d.conn.SetReadDeadline(t)
 }
 
-func (d *DtlsPacketConn) SetWriteDeadline(t time.Time) error {
+func (d *dtlsPacketConn) SetWriteDeadline(t time.Time) error {
 	return d.conn.SetWriteDeadline(t)
 }
 
-// NewKCPOverDTLS creates a KCP session over a DTLS connection.
+// NewKCPOverDTLS creates a KCP session over a DTLS connection and returns
+// an idempotent cleanup function for the entire KCP-over-DTLS transport.
+// After a successful call, the caller should use the returned cleanup instead
+// of closing dtlsConn directly.
+//
 // isServer: true for server-side (listener), false for client-side (dialer).
-func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
-	pc := NewDtlsPacketConn(dtlsConn)
+func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (_ *kcp.UDPSession, cleanup func() error, err error) {
+	var (
+		listener  *kcp.Listener
+		sess      *kcp.UDPSession
+		closeErr  error
+		closeOnce sync.Once
+	)
+	transportCleanup := func() error {
+		closeOnce.Do(func() {
+			var errs []error
+			if sess != nil {
+				if err := sess.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+					errs = append(errs, err)
+				}
+			}
+			if listener != nil {
+				if err := listener.Close(); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+					errs = append(errs, err)
+				}
+			}
+			if err := dtlsConn.Close(); err != nil && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+				errs = append(errs, err)
+			}
+			closeErr = errors.Join(errs...)
+		})
+		return closeErr
+	}
+	defer func() {
+		if err == nil {
+			return
+		}
+		if cleanupErr := transportCleanup(); cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
+		}
+	}()
 
 	block, err := kcp.NewNoneBlockCrypt(nil) // DTLS already encrypts
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-
-	var sess *kcp.UDPSession
 
 	if isServer {
 		// Server: listen on the PacketConn and accept one session
-		var listener *kcp.Listener
-		listener, err = kcp.ServeConn(block, 0, 0, pc)
+		listener, err = kcp.ServeConn(block, 0, 0, &dtlsPacketConn{conn: dtlsConn})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if err = listener.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		sess, err = listener.AcceptKCP()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		// Client: dial through the PacketConn
-		sess, err = kcp.NewConn2(dtlsConn.RemoteAddr(), block, 0, 0, pc)
+		sess, err = kcp.NewConn2(dtlsConn.RemoteAddr(), block, 0, 0, &dtlsPacketConn{conn: dtlsConn})
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
@@ -89,7 +123,7 @@ func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
 	sess.SetMtu(1200) // conservative MTU to fit inside DTLS+TURN
 	sess.SetACKNoDelay(true)
 
-	return sess, nil
+	return sess, transportCleanup, nil
 }
 
 // DefaultSmuxConfig returns smux config tuned for TURN tunnel.
