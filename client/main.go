@@ -328,7 +328,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		return nil
 	}
 
-	// Extract session token if redirect_uri present
+	// Extract session token
 	var sessionToken string
 	if RedirectURI != "" {
 		if parsed, err := neturl.Parse(RedirectURI); err == nil {
@@ -336,6 +336,12 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		} else {
 			log.Printf("failed to parse redirect_uri: %v", err)
 			return nil
+		}
+	}
+	// Fallback to top-level session_token field if not in redirect_uri
+	if sessionToken == "" {
+		if st, ok := errData["session_token"].(string); ok {
+			sessionToken = st
 		}
 	}
 
@@ -2072,11 +2078,15 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 		log.Panicf("TCP listen: %s", err)
 	}
 
+<<<<<<< HEAD
 	wrappedListener, err := wrapISHListener(listener)
 	if err != nil {
 		log.Printf("Warning: failed to wrap listener: %v", err)
 		wrappedListener = listener
 	}
+=======
+	wrappedListener := listener
+>>>>>>> fix/vk-captcha-checkbox
 
 	context.AfterFunc(ctx, func() { _ = wrappedListener.Close() })
 	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)

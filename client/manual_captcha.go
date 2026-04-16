@@ -14,6 +14,7 @@ import (
 	"net/http/httputil"
 	neturl "net/url"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -164,10 +165,67 @@ func rewriteProxyCookies(header http.Header) {
 	}
 }
 
+// htmlURLAttrDoubleRe matches src/href/action attributes with double-quoted absolute or protocol-relative URLs.
+var htmlURLAttrDoubleRe = regexp.MustCompile(`(?i)((?:src|href|action)\s*=\s*)"((?:https?:)?//[^"]+)"`)
+
+// htmlURLAttrSingleRe matches src/href/action attributes with single-quoted absolute or protocol-relative URLs.
+var htmlURLAttrSingleRe = regexp.MustCompile(`(?i)((?:src|href|action)\s*=\s*)'((?:https?:)?//[^']+)'`)
+
+// rewriteHTMLAttrsServerSide rewrites absolute and protocol-relative URLs in src/href/action
+// attributes of raw HTML. URLs matching the upstream origin are redirected to localhost;
+// all other absolute URLs are routed through /generic_proxy so that cross-domain resources
+// (st.vk.com, userapi.com, etc.) load correctly through the proxy.
+func rewriteHTMLAttrsServerSide(html string, targetURL *neturl.URL) string {
+	localOrigin := localCaptchaOrigin()
+	upstreamOrigin := targetOrigin(targetURL)
+
+	rewriteURL := func(rawURL string) string {
+		// Normalise protocol-relative URL to absolute using the upstream scheme
+		absURL := rawURL
+		if strings.HasPrefix(rawURL, "//") {
+			absURL = targetURL.Scheme + ":" + rawURL
+		}
+		if strings.HasPrefix(absURL, upstreamOrigin) {
+			return localOrigin + absURL[len(upstreamOrigin):]
+		}
+		// Already points to local proxy — leave as-is
+		if strings.HasPrefix(absURL, localOrigin) {
+			return rawURL
+		}
+		// Any other absolute URL → route through generic_proxy
+		return "/generic_proxy?proxy_url=" + neturl.QueryEscape(absURL)
+	}
+
+	html = htmlURLAttrDoubleRe.ReplaceAllStringFunc(html, func(match string) string {
+		groups := htmlURLAttrDoubleRe.FindStringSubmatch(match)
+		if len(groups) < 3 {
+			return match
+		}
+		return groups[1] + `"` + rewriteURL(groups[2]) + `"`
+	})
+
+	html = htmlURLAttrSingleRe.ReplaceAllStringFunc(html, func(match string) string {
+		groups := htmlURLAttrSingleRe.FindStringSubmatch(match)
+		if len(groups) < 3 {
+			return match
+		}
+		return groups[1] + `'` + rewriteURL(groups[2]) + `'`
+	})
+
+	return html
+}
+
 func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 	localOrigin := localCaptchaOrigin()
 	upstreamOrigin := targetOrigin(targetURL)
+
+	// Step 1: plain text replacement for the primary upstream origin
 	html = strings.ReplaceAll(html, upstreamOrigin, localOrigin)
+
+	// Step 2: rewrite all other absolute URLs in HTML attributes server-side.
+	// This is critical: the browser begins downloading <script src> / <link href> / <img src>
+	// resources immediately as it parses HTML — before any injected JS can intercept them.
+	html = rewriteHTMLAttrsServerSide(html, targetURL)
 
 	script := fmt.Sprintf(`
 <script>
@@ -325,7 +383,11 @@ func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 </script>
 `, localOrigin, upstreamOrigin)
 
+	// Step 3: inject the client-side script as early as possible — at the opening <head> tag
+	// so that XHR/fetch overrides are active before any inline <script> block in <head> runs.
 	switch {
+	case strings.Contains(html, "<head>"):
+		return strings.Replace(html, "<head>", "<head>"+script, 1)
 	case strings.Contains(html, "</head>"):
 		return strings.Replace(html, "</head>", script+"</head>", 1)
 	case strings.Contains(html, "</body>"):
@@ -395,6 +457,7 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	fmt.Println("==============================================")
 	fmt.Println()
 
+	log.Printf("[%s] Opening browser: %s", logPrefix, captchaURL)
 	openBrowser(captchaURL)
 
 	key := <-keyCh
@@ -570,6 +633,26 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 				req.Out.URL.RawQuery = targetParsed.RawQuery
 				rewriteProxyRequest(req.Out, targetParsed)
 			},
+			ModifyResponse: func(res *http.Response) error {
+				// Strip security headers that can block cross-origin resource loading
+				// when static assets (JS/CSS) are served through the proxy.
+				for _, h := range []string{
+					"Content-Security-Policy",
+					"Content-Security-Policy-Report-Only",
+					"X-Content-Security-Policy",
+					"X-WebKit-CSP",
+					"Cross-Origin-Opener-Policy",
+					"Cross-Origin-Embedder-Policy",
+					"Cross-Origin-Resource-Policy",
+					"X-Frame-Options",
+					"Strict-Transport-Security",
+				} {
+					res.Header.Del(h)
+				}
+				// Allow the browser to use the resource cross-origin
+				res.Header.Set("Access-Control-Allow-Origin", "*")
+				return nil
+			},
 		}
 		genericReverse.ServeHTTP(w, r)
 	})
@@ -598,7 +681,13 @@ func openBrowser(url string) {
 func browserOpenCommands(goos string, url string) []browserCommand {
 	switch goos {
 	case "windows":
-		return []browserCommand{{name: "cmd", args: []string{"/c", "start", url}}}
+		// 'rundll32 url.dll,FileProtocolHandler' is more reliable than 'cmd /c start'
+		// because it doesn't involve the shell (cmd.exe), avoiding issues with '&' and other special characters.
+		return []browserCommand{
+			{name: "rundll32", args: []string{"url.dll,FileProtocolHandler", url}},
+			// Fallback with empty title argument for 'start' to handle potential quoting issues
+			{name: "cmd", args: []string{"/c", "start", "", url}},
+		}
 	case "darwin":
 		return []browserCommand{{name: "open", args: []string{url}}}
 	case "linux":
