@@ -17,6 +17,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/bschaatsbergen/dnsdialer"
 )
 
 const captchaListenPort = "8765"
@@ -123,6 +125,7 @@ func rewriteProxyRequest(req *http.Request, targetURL *neturl.URL) {
 	req.Host = targetURL.Host
 
 	req.Header.Del("Accept-Encoding")
+	req.Header.Del("TE") // Disable transfer encoding compression
 	for _, headerName := range []string{"Origin", "Referer"} {
 		if rewritten := rewriteProxyHeaderURL(req.Header.Get(headerName), targetURL); rewritten != "" {
 			req.Header.Set(headerName, rewritten)
@@ -332,6 +335,21 @@ func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 	}
 }
 
+func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
+	transport := &http.Transport{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     false,
+	}
+	if dialer != nil {
+		transport.DialContext = dialer.DialContext
+	}
+	return transport
+}
+
 func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	var listenErrs []string
 	var listening bool
@@ -357,6 +375,7 @@ func startCaptchaServer(srv *http.Server, logPrefix string) error {
 	return fmt.Errorf("captcha listeners failed: %s", strings.Join(listenErrs, "; "))
 }
 
+// runCaptchaServerAndWait triggers the browser, and waiting gracefully for the solution token.
 func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-chan string, logPrefix string) (string, error) {
 	srv := &http.Server{Handler: handler}
 
@@ -383,6 +402,7 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	return key, nil
 }
 
+// notifyKey pushes the key string to the given channel without blocking
 func notifyKey(keyCh chan<- string, key string) {
 	if key != "" {
 		select {
@@ -423,7 +443,7 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
 }
 
-func solveCaptchaViaProxy(redirectURI string) (string, error) {
+func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
 	keyCh := make(chan string, 1)
 
 	targetURL, err := neturl.Parse(redirectURI)
@@ -431,14 +451,7 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 		return "", fmt.Errorf("invalid redirect URI: %v", err)
 	}
 
-	transport := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-	}
+	transport := newCaptchaProxyTransport(dialer)
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -446,16 +459,17 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 			rewriteProxyRequest(req.Out, targetURL)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			log.Printf("captcha proxy error for %s: %v", r.URL.String(), err)
+			log.Printf("[Captcha Proxy] ERROR for %s %s: %v", r.Method, r.URL.String(), err)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.WriteHeader(http.StatusBadGateway)
-			_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:20px"><h2>Captcha proxy error</h2><p>%v</p></body></html>`, err)
+			_, _ = fmt.Fprintf(w, `<!DOCTYPE html><html><body style="font-family:sans-serif;padding:20px"><h2>Captcha proxy error</h2><p>%s %s</p><p>%v</p></body></html>`, r.Method, r.URL.String(), err)
 		},
 		ModifyResponse: func(res *http.Response) error {
 			rewriteProxyCookies(res.Header)
 
 			if res.StatusCode >= 300 && res.StatusCode < 400 {
 				if loc := res.Header.Get("Location"); loc != "" {
+					log.Printf("[Captcha Proxy] Redirecting to: %s", loc)
 					if rewritten, ok := rewriteProxyRedirectLocation(loc, targetURL); ok {
 						res.Header.Set("Location", rewritten)
 					} else {
@@ -465,7 +479,13 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 			}
 
 			contentType := res.Header.Get("Content-Type")
-			shouldInspectBody := strings.Contains(contentType, "text/html") || strings.Contains(res.Request.URL.Path, "captchaNotRobot.check")
+			contentEncoding := res.Header.Get("Content-Encoding")
+			log.Printf("[Captcha Proxy] %s %d | Content-Type: %q, Encoding: %q", res.Request.Method, res.StatusCode, contentType, contentEncoding)
+
+			shouldInspectBody := strings.Contains(contentType, "text/html") ||
+				strings.Contains(contentType, "application/xhtml+xml") ||
+				strings.Contains(res.Request.URL.Path, "captchaNotRobot.check")
+
 			if !shouldInspectBody {
 				return nil
 			}
@@ -476,7 +496,9 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 				if err == nil {
 					reader = gzReader
 					defer func() {
-						_ = gzReader.Close()
+						if err := gzReader.Close(); err != nil {
+							log.Printf("failed to close gzip reader: %v", err)
+						}
 					}()
 				}
 			}
@@ -503,6 +525,8 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 					"Cross-Origin-Embedder-Policy",
 					"Cross-Origin-Resource-Policy",
 					"X-Frame-Options",
+					"Strict-Transport-Security",
+					"Alt-Svc",
 				} {
 					res.Header.Del(headerName)
 				}
@@ -521,7 +545,7 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/local-captcha-result", func(w http.ResponseWriter, r *http.Request) {
-		notifyKey(keyCh, r.FormValue("token"))
+		notifyKey(keyCh, r.FormValue("token")) // r.FormValue automatically parses the form
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		_, _ = fmt.Fprint(w, "ok")
 	})
@@ -545,7 +569,9 @@ func solveCaptchaViaProxy(redirectURI string) (string, error) {
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[Captcha Proxy] HTTP %s %s", r.Method, r.URL.String())
 		if r.URL.Path == "/" && targetURL.Path != "" && targetURL.Path != "/" && r.URL.RawQuery == "" {
+			log.Printf("[Captcha Proxy] Redirecting ROOT to: %s", localCaptchaURLForTarget(targetURL))
 			http.Redirect(w, r, localCaptchaURLForTarget(targetURL), http.StatusTemporaryRedirect)
 			return
 		}
@@ -573,6 +599,18 @@ func browserOpenCommands(goos string, url string) []browserCommand {
 		return []browserCommand{
 			{name: "xdg-open", args: []string{url}},
 			{name: "gio", args: []string{"open", url}},
+		}
+	case "android":
+		return []browserCommand{
+			{name: "termux-open-url", args: []string{url}},
+			{name: "/system/bin/am", args: []string{"start", "-a", "android.intent.action.VIEW", "-d", url}},
+			{name: "am", args: []string{"start", "-a", "android.intent.action.VIEW", "-d", url}},
+			{name: "xdg-open", args: []string{url}},
+		}
+	case "ios":
+		return []browserCommand{
+			{name: "open", args: []string{url}},
+			{name: "uiopen", args: []string{url}},
 		}
 	}
 	return nil

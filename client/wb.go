@@ -17,12 +17,14 @@ import (
 	"strings"
 	"time"
 
+	fhttp "github.com/bogdanfinn/fhttp"
+	tlsclient "github.com/bogdanfinn/tls-client"
+	"github.com/bogdanfinn/tls-client/profiles"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	wbBase        = "https://stream.wb.ru"
-	wbUA          = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+	wbBase = "https://stream.wb.ru"
 )
 
 // WbTurnCred stores a single TURN credential
@@ -48,32 +50,19 @@ func wbFetch(ctx context.Context, link string) (string, string, string, error) {
 	return "", "", "", fmt.Errorf("no TURN credentials received from WB")
 }
 
-// wbHTTPClient creates a WB HTTP client
-func wbHTTPClient() *http.Client {
-	return &http.Client{
-		Timeout: 15 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 100,
-			IdleConnTimeout:     90 * time.Second,
-			TLSClientConfig:     &tls.Config{},
-		},
-	}
-}
-
-// wbReq makes an HTTP request to WB API
-func wbReq(ctx context.Context, client *http.Client, method, ep string, body []byte, tok string) ([]byte, error) {
+// wbReq makes an HTTP request to WB API using tls-client
+func wbReq(ctx context.Context, client tlsclient.HttpClient, profile Profile, method, ep string, body []byte, tok string) ([]byte, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
 
-	rq, err := http.NewRequestWithContext(ctx, method, wbBase+ep, rd)
+	rq, err := fhttp.NewRequestWithContext(ctx, method, wbBase+ep, rd)
 	if err != nil {
 		return nil, err
 	}
 
-	rq.Header.Set("User-Agent", wbUA)
+	applyBrowserProfileFhttp(rq, profile)
 	rq.Header.Set("Accept", "application/json")
 	rq.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	rq.Header.Set("Origin", wbBase)
@@ -113,13 +102,26 @@ func wbReq(ctx context.Context, client *http.Client, method, ep string, body []b
 
 // fetchWbCreds performs the full WB credential acquisition flow
 func fetchWbCreds(ctx context.Context) ([]WbTurnCred, error) {
-	client := wbHTTPClient()
-	defer client.CloseIdleConnections()
+	profile := Profile{
+		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
+		SecChUaMobile:   "?0",
+		SecChUaPlatform: `"Windows"`,
+	}
+
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+		tlsclient.WithTimeoutSeconds(20),
+		tlsclient.WithClientProfile(profiles.Chrome_146),
+		tlsclient.WithDialer(getCustomNetDialer()),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize tls_client: %w", err)
+	}
 
 	nm := fmt.Sprintf("lh_%d", time.Now().UnixMilli()%100000)
 
 	log.Println("[WB Auth] Step 1: Guest registration...")
-	rr, err := wbReq(ctx, client, "POST", "/auth/api/v1/auth/user/guest-register",
+	rr, err := wbReq(ctx, client, profile, "POST", "/auth/api/v1/auth/user/guest-register",
 		[]byte(`{"displayName":"`+nm+`"}`), "")
 	if err != nil {
 		return nil, fmt.Errorf("guest register: %w", err)
@@ -137,7 +139,7 @@ func fetchWbCreds(ctx context.Context) ([]WbTurnCred, error) {
 	log.Println("[WB Auth] Guest registered")
 
 	log.Println("[WB Auth] Step 2: Create room...")
-	rr, err = wbReq(ctx, client, "POST", "/api-room/api/v2/room",
+	rr, err = wbReq(ctx, client, profile, "POST", "/api-room/api/v2/room",
 		[]byte(`{"roomType":"ROOM_TYPE_ALL_ON_SCREEN","roomPrivacy":"ROOM_PRIVACY_FREE"}`),
 		reg.AccessToken)
 	if err != nil {
@@ -160,14 +162,14 @@ func fetchWbCreds(ctx context.Context) ([]WbTurnCred, error) {
 	log.Printf("[WB Auth] Room created: %s", roomPreview)
 
 	log.Println("[WB Auth] Step 3: Join room...")
-	_, err = wbReq(ctx, client, "POST", fmt.Sprintf("/api-room/api/v1/room/%s/join", room.RoomID),
+	_, err = wbReq(ctx, client, profile, "POST", fmt.Sprintf("/api-room/api/v1/room/%s/join", room.RoomID),
 		[]byte("{}"), reg.AccessToken)
 	if err != nil {
 		return nil, fmt.Errorf("join room: %w", err)
 	}
 
 	log.Println("[WB Auth] Step 4: Get room token...")
-	rr, err = wbReq(ctx, client, "GET", fmt.Sprintf(
+	rr, err = wbReq(ctx, client, profile, "GET", fmt.Sprintf(
 		"/api-room-manager/api/v1/room/%s/token?deviceType=PARTICIPANT_DEVICE_TYPE_WEB_DESKTOP&displayName=%s",
 		room.RoomID, url.QueryEscape(nm)), nil, reg.AccessToken)
 	if err != nil {
@@ -185,7 +187,7 @@ func fetchWbCreds(ctx context.Context) ([]WbTurnCred, error) {
 	}
 
 	log.Println("[WB Auth] Step 5: Negotiating ICE (LiveKit)...")
-	creds, err := wbLkICE(ctx, tok.RoomToken)
+	creds, err := wbLkICE(ctx, tok.RoomToken, profile.UserAgent)
 	if err != nil {
 		return nil, fmt.Errorf("livekit ICE: %w", err)
 	}
@@ -198,17 +200,18 @@ func fetchWbCreds(ctx context.Context) ([]WbTurnCred, error) {
 }
 
 // wbLkICE connects to LiveKit WebSocket and extracts TURN credentials
-func wbLkICE(ctx context.Context, token string) ([]WbTurnCred, error) {
+func wbLkICE(ctx context.Context, token string, userAgent string) ([]WbTurnCred, error) {
 	u := "wss://wbstream01-el.wb.ru:7880/rtc?access_token=" + url.QueryEscape(token) +
 		"&auto_subscribe=1&sdk=js&version=2.15.3&protocol=16&adaptive_stream=1"
+
+	header := http.Header{}
+	header.Set("User-Agent", userAgent)
+	header.Set("Origin", wbBase)
 
 	conn, _, err := (&websocket.Dialer{
 		TLSClientConfig:  &tls.Config{},
 		HandshakeTimeout: 10 * time.Second,
-	}).DialContext(ctx, u, http.Header{
-		"User-Agent": {wbUA},
-		"Origin":     {wbBase},
-	})
+	}).DialContext(ctx, u, header)
 	if err != nil {
 		return nil, err
 	}

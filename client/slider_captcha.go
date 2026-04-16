@@ -1,25 +1,9 @@
-/* SPDX-License-Identifier: Apache-2.0
- *
- * Copyright © 2026 WireGuard LLC. All Rights Reserved.
- */
-
 package main
-
-/*
-#include <stdlib.h>
-// These are JNI functions from Android, they won't work in standalone exe
-// But we keep the signature for consistency with libwg-go if asked
-// extern const char* requestCaptcha(const char* redirect_uri);
-*/
-// import "C" // Disabled cgo for standalone compatibility unless strictly needed
 
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -27,286 +11,44 @@ import (
 	_ "image/jpeg"
 	"io"
 	"log"
-	"math/rand"
-	"net"
-	"net/http"
-	"net/url"
+	neturl "net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
+
+	fhttp "github.com/bogdanfinn/fhttp"
+	tlsclient "github.com/bogdanfinn/tls-client"
 )
 
-// --- Compatibility Shims for Standalone vk-turn-proxy ---
-
-func turnLog(format string, v ...interface{}) {
-	log.Printf(format, v...)
-}
-
-// Simple host cache for standalone
-var hostCache = &simpleHostCache{}
-
-type simpleHostCache struct{}
-
-func (s *simpleHostCache) Resolve(ctx context.Context, host string) (string, error) {
-	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return "", err
-	}
-	if len(ips) == 0 {
-		return "", fmt.Errorf("no IP found for %s", host)
-	}
-	return ips[0].IP.String(), nil
-}
-
-// No-op protectControl for standalone
-func protectControl(network, address string, c syscall.RawConn) error {
-	return nil
-}
-
-// --- Original libwg-go code (adapted) ---
-
-// VkCaptchaError represents a VK captcha error
-type VkCaptchaError struct {
-	ErrorCode               int
-	ErrorMsg                string
-	CaptchaSid              string
-	CaptchaImg              string
-	RedirectUri             string
-	IsSoundCaptchaAvailable bool
-	SessionToken            string
-	CaptchaTs               string // captcha_ts from error
-	CaptchaAttempt          string // captcha_attempt from error
-}
-
-// ParseVkCaptchaError parses a VK error response into VkCaptchaError
-func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
-	codeFloat, _ := errData["error_code"].(float64)
-	code := int(codeFloat)
-
-	redirectUri, _ := errData["redirect_uri"].(string)
-	captchaSid, _ := errData["captcha_sid"].(string)
-	captchaImg, _ := errData["captcha_img"].(string)
-	errorMsg, _ := errData["error_msg"].(string)
-
-	// Extract session_token from redirect_uri
-	var sessionToken string
-	if redirectUri != "" {
-		if parsed, err := url.Parse(redirectUri); err == nil {
-			sessionToken = parsed.Query().Get("session_token")
-		}
-	}
-
-	isSound, _ := errData["is_sound_captcha_available"].(bool)
-
-	// captcha_ts can be float64 (scientific notation) or string
-	var captchaTs string
-	if tsFloat, ok := errData["captcha_ts"].(float64); ok {
-		captchaTs = fmt.Sprintf("%.0f", tsFloat)
-	} else if tsStr, ok := errData["captcha_ts"].(string); ok {
-		captchaTs = tsStr
-	}
-
-	// captcha_attempt is usually a float64
-	var captchaAttempt string
-	if attFloat, ok := errData["captcha_attempt"].(float64); ok {
-		captchaAttempt = fmt.Sprintf("%.0f", attFloat)
-	} else if attStr, ok := errData["captcha_attempt"].(string); ok {
-		captchaAttempt = attStr
-	}
-
-	return &VkCaptchaError{
-		ErrorCode:               code,
-		ErrorMsg:                errorMsg,
-		CaptchaSid:              captchaSid,
-		CaptchaImg:              captchaImg,
-		RedirectUri:             redirectUri,
-		IsSoundCaptchaAvailable: isSound,
-		SessionToken:            sessionToken,
-		CaptchaTs:               captchaTs,
-		CaptchaAttempt:          captchaAttempt,
-	}
-}
-
-// IsCaptchaError checks if the error data is a Not Robot Captcha error
-func (e *VkCaptchaError) IsCaptchaError() bool {
-	return e.ErrorCode == 14 && e.RedirectUri != "" && e.SessionToken != ""
-}
-
-// captchaMutex serializes captcha solving to avoid multiple concurrent attempts
-var captchaMutex sync.Mutex
-
-// SolveVkCaptcha solves the VK Not Robot Captcha and returns success_token
-// First tries automatic solution, falls back to manual solution if it fails
-func SolveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
-	// Serialize captcha solving to avoid multiple concurrent attempts
-	captchaMutex.Lock()
-	defer captchaMutex.Unlock()
-
-	turnLog("[Captcha] Solving Not Robot Captcha...")
-
-	// Step 1: Try automatic solution
-	turnLog("[Captcha] Attempting automatic solution...")
-	successToken, err := solveVkCaptchaAutomatic(ctx, captchaErr)
-	if err == nil && successToken != "" {
-		turnLog("[Captcha] Automatic solution SUCCESS!")
-		return successToken, nil
-	}
-
-	turnLog("[Captcha] Automatic solution FAILED: %v", err)
-
-	// Step 2: Fall back to manual solving
-	turnLog("[Captcha] Triggering manual captcha fallback...")
-	if captchaErr.RedirectUri != "" {
-		return solveCaptchaViaProxy(captchaErr.RedirectUri)
-	} else if captchaErr.CaptchaImg != "" {
-		return solveCaptchaViaHTTP(captchaErr.CaptchaImg)
-	}
-
-	return "", fmt.Errorf("no more solve modes available")
-}
-
-// solveVkCaptchaAutomatic performs the automatic captcha solving without UI
-func solveVkCaptchaAutomatic(ctx context.Context, captchaErr *VkCaptchaError) (string, error) {
-	sessionToken := captchaErr.SessionToken
-	if sessionToken == "" {
-		return "", fmt.Errorf("no session_token in redirect_uri")
-	}
-
-	// Step 1: Fetch the captcha HTML page to get powInput
-	bootstrap, err := fetchCaptchaBootstrap(ctx, captchaErr.RedirectUri)
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch captcha bootstrap: %w", err)
-	}
-
-	turnLog("[Captcha] PoW input: %s, difficulty: %d", bootstrap.PowInput, bootstrap.Difficulty)
-
-	// Step 2: Solve PoW
-	hash := solvePoW(bootstrap.PowInput, bootstrap.Difficulty)
-	turnLog("[Captcha] PoW solved: hash=%s", hash)
-
-	// Step 3: Call captchaNotRobot API with slider POC support
-	successToken, err := callCaptchaNotRobotWithSliderPOC(ctx, sessionToken, hash, bootstrap.Settings)
-	if err != nil {
-		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
-	}
-
-	turnLog("[Captcha] Success! Got success_token")
-	return successToken, nil
-}
-
-// fetchCaptchaBootstrap fetches the captcha HTML page and extracts PoW input, difficulty, and settings
-func fetchCaptchaBootstrap(ctx context.Context, redirectUri string) (*captchaBootstrap, error) {
-	parsedURL, err := url.Parse(redirectUri)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse redirect_uri: %w", err)
-	}
-
-	domain := parsedURL.Hostname()
-	resolvedIP, err := hostCache.Resolve(ctx, domain)
-	if err != nil {
-		return nil, fmt.Errorf("DNS resolution failed for %s: %w", domain, err)
-	}
-
-	port := parsedURL.Port()
-	if port == "" {
-		port = "443"
-	}
-	ipURL := "https://" + resolvedIP + ":" + port + parsedURL.Path
-	if parsedURL.RawQuery != "" {
-		ipURL += "?" + parsedURL.RawQuery
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", ipURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Host = domain
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				// Control:   protectControl, // Disabled for standalone
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				ServerName: domain,
-			},
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	html := string(body)
-	bootstrap, err := parseCaptchaBootstrapHTML(html)
-	if err != nil {
-		return nil, err
-	}
-
-	return bootstrap, nil
-}
-
-// solvePoW finds nonce where SHA-256(powInput + nonce) starts with '0' * difficulty
-func solvePoW(powInput string, difficulty int) string {
-	target := strings.Repeat("0", difficulty)
-
-	for nonce := 1; nonce <= 10000000; nonce++ {
-		data := powInput + strconv.Itoa(nonce)
-		hash := sha256.Sum256([]byte(data))
-		hexHash := hex.EncodeToString(hash[:])
-
-		if strings.HasPrefix(hexHash, target) {
-			return hexHash
-		}
-	}
-
-	// Fallback: should not happen with difficulty <= 3
-	return ""
-}
-
 const (
+	captchaDebugInfo      = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
 )
 
-// captchaBootstrap holds parsed captcha bootstrap data
-type captchaBootstrap struct {
-	PowInput   string
-	Difficulty int
-	Settings   *captchaSettingsResponse
+type captchaNotRobotSession struct {
+	ctx          context.Context
+	sessionToken string
+	hash         string
+	streamID     int
+	client       tlsclient.HttpClient
+	profile      Profile
+	browserFp    string
 }
 
-// captchaSettingsResponse holds captcha settings from VK API
 type captchaSettingsResponse struct {
 	ShowCaptchaType string
 	SettingsByType  map[string]string
 }
 
-// captchaCheckResult holds the result of a captcha check request
 type captchaCheckResult struct {
 	Status          string
 	SuccessToken    string
 	ShowCaptchaType string
 }
 
-// sliderCaptchaContent holds decoded slider captcha content
 type sliderCaptchaContent struct {
 	Image    image.Image
 	Size     int
@@ -314,41 +56,39 @@ type sliderCaptchaContent struct {
 	Attempts int
 }
 
-// sliderCandidate represents a ranked slider candidate
 type sliderCandidate struct {
 	Index       int
 	ActiveSteps []int
 	Score       int64
 }
 
-// captchaNotRobotSession represents a captcha solving session
-type captchaNotRobotSession struct {
-	ctx          context.Context
-	sessionToken string
-	hash         string
-	browserFp    string
+type captchaBootstrap struct {
+	PowInput   string
+	Difficulty int
+	Settings   *captchaSettingsResponse
 }
 
-// newCaptchaNotRobotSession creates a new captcha solving session
 func newCaptchaNotRobotSession(
 	ctx context.Context,
 	sessionToken string,
 	hash string,
+	streamID int,
+	client tlsclient.HttpClient,
+	profile Profile,
 ) *captchaNotRobotSession {
-	// Generate random browser fingerprint
-	browserFp := fmt.Sprintf("%032x", randInt63())
-
 	return &captchaNotRobotSession{
 		ctx:          ctx,
 		sessionToken: sessionToken,
 		hash:         hash,
-		browserFp:    browserFp,
+		streamID:     streamID,
+		client:       client,
+		profile:      profile,
+		browserFp:    generateBrowserFp(profile),
 	}
 }
 
-// baseValues returns base URL values for API requests
-func (s *captchaNotRobotSession) baseValues() url.Values {
-	values := url.Values{}
+func (s *captchaNotRobotSession) baseValues() neturl.Values {
+	values := neturl.Values{}
 	values.Set("session_token", s.sessionToken)
 	values.Set("domain", "vk.com")
 	values.Set("adFp", "")
@@ -356,85 +96,34 @@ func (s *captchaNotRobotSession) baseValues() url.Values {
 	return values
 }
 
-// request makes a VK API request
-func (s *captchaNotRobotSession) request(method string, values url.Values) (map[string]interface{}, error) {
+func (s *captchaNotRobotSession) request(method string, values neturl.Values) (map[string]interface{}, error) {
 	reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 
-	parsedURL, err := url.Parse(reqURL)
+	req, err := fhttp.NewRequestWithContext(s.ctx, "POST", reqURL, strings.NewReader(values.Encode()))
 	if err != nil {
 		return nil, err
 	}
 
-	domain := parsedURL.Hostname()
-	resolvedIP, err := hostCache.Resolve(s.ctx, domain)
+	httpResp, err := s.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("DNS resolution failed for %s: %w", domain, err)
+		return nil, err
 	}
+	defer func() {
+		_ = httpResp.Body.Close()
+	}()
 
-	port := parsedURL.Port()
-	if port == "" {
-		port = "443"
-	}
-	ipURL := "https://" + resolvedIP + ":" + port + parsedURL.Path
-	if parsedURL.RawQuery != "" {
-		ipURL += "?" + parsedURL.RawQuery
-	}
-
-	req, err := http.NewRequestWithContext(s.ctx, "POST", ipURL, strings.NewReader(values.Encode()))
+	body, err := io.ReadAll(httpResp.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Host = domain
-	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36")
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Origin", "https://vk.ru")
-	req.Header.Set("Referer", "https://vk.ru/")
-	req.Header.Set("sec-ch-ua-platform", "\"Linux\"")
-	req.Header.Set("sec-ch-ua", "\"Chromium\";v=\"146\", \"Not-A.Brand\";v=\"24\", \"Google Chrome\";v=\"146\"")
-	req.Header.Set("sec-ch-ua-mobile", "?0")
-	req.Header.Set("DNT", "1")
-	req.Header.Set("Sec-Fetch-Site", "same-site")
-	req.Header.Set("Sec-Fetch-Mode", "cors")
-	req.Header.Set("Sec-Fetch-Dest", "empty")
-	req.Header.Set("Sec-GPC", "1")
-
-	client := &http.Client{
-		Timeout: 20 * time.Second,
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				// Control:   protectControl,
-			}).DialContext,
-			TLSClientConfig: &tls.Config{
-				ServerName: domain,
-			},
-		},
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var respMap map[string]interface{}
-	if err := json.Unmarshal(body, &respMap); err != nil {
-		return nil, err
-	}
-
-	return respMap, nil
+	return resp, nil
 }
 
-// requestSettings fetches captcha settings from VK API
 func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, error) {
 	resp, err := s.request("captchaNotRobot.settings", s.baseValues())
 	if err != nil {
@@ -443,11 +132,10 @@ func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, er
 	return parseCaptchaSettingsResponse(resp)
 }
 
-// requestComponentDone marks the component as done
 func (s *captchaNotRobotSession) requestComponentDone() error {
 	values := s.baseValues()
 	values.Set("browser_fp", s.browserFp)
-	values.Set("device", buildCaptchaDeviceJSON())
+	values.Set("device", buildCaptchaDeviceJSON(s.profile))
 
 	resp, err := s.request("captchaNotRobot.componentDone", values)
 	if err != nil {
@@ -464,12 +152,10 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 	return nil
 }
 
-// requestCheckboxCheck performs a checkbox-style captcha check
 func (s *captchaNotRobotSession) requestCheckboxCheck() (*captchaCheckResult, error) {
-	return s.requestCheck("[]", base64.StdEncoding.EncodeToString([]byte("{}")))
+	return s.requestCheck(generateSliderCursor(0, 1), base64.StdEncoding.EncodeToString([]byte("{}")))
 }
 
-// requestSliderContent fetches slider captcha content
 func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*sliderCaptchaContent, error) {
 	values := s.baseValues()
 	if sliderSettings != "" {
@@ -483,7 +169,6 @@ func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*s
 	return parseSliderCaptchaContentResponse(resp)
 }
 
-// requestSliderCheck performs a slider captcha check
 func (s *captchaNotRobotSession) requestSliderCheck(activeSteps []int, candidateIndex int, candidateCount int) (*captchaCheckResult, error) {
 	answer, err := encodeSliderAnswer(activeSteps)
 	if err != nil {
@@ -493,7 +178,6 @@ func (s *captchaNotRobotSession) requestSliderCheck(activeSteps []int, candidate
 	return s.requestCheck(generateSliderCursor(candidateIndex, candidateCount), answer)
 }
 
-// requestCheck performs the main captcha check request
 func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*captchaCheckResult, error) {
 	values := s.baseValues()
 	values.Set("accelerometer", "[]")
@@ -506,7 +190,7 @@ func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*ca
 	values.Set("browser_fp", s.browserFp)
 	values.Set("hash", s.hash)
 	values.Set("answer", answer)
-	values.Set("debug_info", "d44f534ce8deb56ba20be52e05c433309b49ee4d2a70602deeb17a1954257785")
+	values.Set("debug_info", captchaDebugInfo)
 
 	resp, err := s.request("captchaNotRobot.check", values)
 	if err != nil {
@@ -515,24 +199,25 @@ func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*ca
 	return parseCaptchaCheckResult(resp)
 }
 
-// requestEndSession ends the captcha session
 func (s *captchaNotRobotSession) requestEndSession() {
-	turnLog("[Captcha] Step 4/4: endSession")
+	log.Printf("[STREAM %d] [Captcha] Step 4/4: endSession", s.streamID)
 	if _, err := s.request("captchaNotRobot.endSession", s.baseValues()); err != nil {
-		turnLog("[Captcha] Warning: endSession failed: %v", err)
+		log.Printf("[STREAM %d] [Captcha] Warning: endSession failed: %v", s.streamID, err)
 	}
 }
 
-// callCaptchaNotRobotWithSliderPOC solves captcha with slider POC support
 func callCaptchaNotRobotWithSliderPOC(
 	ctx context.Context,
 	sessionToken string,
 	hash string,
+	streamID int,
+	client tlsclient.HttpClient,
+	profile Profile,
 	initialSettings *captchaSettingsResponse,
 ) (string, error) {
-	session := newCaptchaNotRobotSession(ctx, sessionToken, hash)
+	session := newCaptchaNotRobotSession(ctx, sessionToken, hash, streamID, client, profile)
 
-	turnLog("[Captcha] Step 1/4: settings")
+	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	settingsResp, err := session.requestSettings()
 	if err != nil {
 		return "", err
@@ -541,14 +226,14 @@ func callCaptchaNotRobotWithSliderPOC(
 
 	time.Sleep(200 * time.Millisecond)
 
-	turnLog("[Captcha] Step 2/4: componentDone")
+	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
 	if err := session.requestComponentDone(); err != nil {
 		return "", err
 	}
 
 	time.Sleep(200 * time.Millisecond)
 
-	turnLog("[Captcha] Step 3/4: check")
+	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
 	initialCheck, err := session.requestCheckboxCheck()
 	if err != nil {
 		return "", err
@@ -557,14 +242,14 @@ func callCaptchaNotRobotWithSliderPOC(
 		if initialCheck.SuccessToken == "" {
 			return "", fmt.Errorf("success_token not found")
 		}
-		time.Sleep(200 * time.Millisecond)
 		session.requestEndSession()
 		return initialCheck.SuccessToken, nil
 	}
 
 	sliderSettings, hasSlider := settingsResp.SettingsByType[sliderCaptchaType]
-	turnLog(
-		"[Captcha] Checkbox-style check returned status=%s (settings show_type=%q, check show_type=%q, available_types=%s)",
+	log.Printf(
+		"[STREAM %d] [Captcha] Checkbox-style check returned status=%s (settings show_type=%q, check show_type=%q, available_types=%s)",
+		streamID,
 		initialCheck.Status,
 		settingsResp.ShowCaptchaType,
 		initialCheck.ShowCaptchaType,
@@ -572,15 +257,32 @@ func callCaptchaNotRobotWithSliderPOC(
 	)
 
 	if !hasSlider {
-		turnLog(
-			"[Captcha] Slider settings not found in settings response. Trying getContent without captcha_settings...",
+		log.Printf(
+			"[STREAM %d] [Captcha] Slider settings not found in settings response. Trying getContent without captcha_settings...",
+			streamID,
 		)
 	} else {
-		turnLog("[Captcha] Trying experimental slider solver...")
+		log.Printf("[STREAM %d] [Captcha] Trying experimental slider solver...", streamID)
 	}
 
 	sliderContent, err := session.requestSliderContent(sliderSettings)
 	if err != nil {
+		log.Printf(
+			"[STREAM %d] [Captcha] Slider getContent failed (status: %v). Trying to solve as a checkbox instead...",
+			streamID,
+			err,
+		)
+		// Fallback: maybe it's just a checkbox that needs a human-like check
+		time.Sleep(300 * time.Millisecond)
+		finalCheck, err2 := session.requestCheckboxCheck()
+		if err2 == nil && finalCheck.Status == "OK" {
+			if finalCheck.SuccessToken == "" {
+				return "", fmt.Errorf("success_token not found in fallback check")
+			}
+			log.Printf("[STREAM %d] [Captcha] Fallback checkbox check succeeded!", streamID)
+			session.requestEndSession()
+			return finalCheck.SuccessToken, nil
+		}
 		return "", fmt.Errorf("check status: %s (slider getContent failed: %w)", initialCheck.Status, err)
 	}
 
@@ -589,16 +291,18 @@ func callCaptchaNotRobotWithSliderPOC(
 		return "", err
 	}
 
-	turnLog(
-		"[Captcha] Ranked %d slider positions locally; submitting top %d based on attempt budget %d",
+	log.Printf(
+		"[STREAM %d] [Captcha] Ranked %d slider positions locally; submitting top %d based on attempt budget %d",
+		streamID,
 		len(candidates),
 		minInt(sliderContent.Attempts, len(candidates)),
 		sliderContent.Attempts,
 	)
 
 	successToken, err := trySliderCaptchaCandidates(candidates, sliderContent.Attempts, func(candidate sliderCandidate) (*captchaCheckResult, error) {
-		turnLog(
-			"[Captcha] Slider guess position=%d score=%d",
+		log.Printf(
+			"[STREAM %d] [Captcha] Slider guess position=%d score=%d",
+			streamID,
 			candidate.Index,
 			candidate.Score,
 		)
@@ -608,19 +312,17 @@ func callCaptchaNotRobotWithSliderPOC(
 		return "", err
 	}
 
-	time.Sleep(200 * time.Millisecond)
 	session.requestEndSession()
 	return successToken, nil
 }
 
-// buildCaptchaDeviceJSON builds device information JSON
-func buildCaptchaDeviceJSON() string {
+func buildCaptchaDeviceJSON(profile Profile) string {
 	return fmt.Sprintf(
-		`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default"}`,
+		`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
+		profile.UserAgent,
 	)
 }
 
-// parseCaptchaSettingsResponse parses captcha settings from API response
 func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettingsResponse, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
@@ -659,7 +361,6 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 	return settings, nil
 }
 
-// parseCaptchaBootstrapHTML parses HTML page to extract PoW input and settings
 func parseCaptchaBootstrapHTML(html string) (*captchaBootstrap, error) {
 	powInputRe := regexp.MustCompile(`const\s+powInput\s*=\s*"([^"]+)"`)
 	powInputMatch := powInputRe.FindStringSubmatch(html)
@@ -692,7 +393,6 @@ func parseCaptchaBootstrapHTML(html string) (*captchaBootstrap, error) {
 	}, nil
 }
 
-// parseCaptchaSettingsFromHTML parses captcha settings from HTML window.init
 func parseCaptchaSettingsFromHTML(html string) (*captchaSettingsResponse, error) {
 	initRe := regexp.MustCompile(`(?s)window\.init\s*=\s*(\{.*?})\s*;\s*window\.lang`)
 	initMatch := initRe.FindStringSubmatch(html)
@@ -718,7 +418,6 @@ func parseCaptchaSettingsFromHTML(html string) (*captchaSettingsResponse, error)
 	})
 }
 
-// mergeCaptchaSettings merges two captcha settings responses
 func mergeCaptchaSettings(primary *captchaSettingsResponse, fallback *captchaSettingsResponse) *captchaSettingsResponse {
 	if primary == nil {
 		return cloneCaptchaSettings(fallback)
@@ -740,7 +439,6 @@ func mergeCaptchaSettings(primary *captchaSettingsResponse, fallback *captchaSet
 	return primary
 }
 
-// cloneCaptchaSettings clones a captcha settings response
 func cloneCaptchaSettings(src *captchaSettingsResponse) *captchaSettingsResponse {
 	if src == nil {
 		return nil
@@ -756,7 +454,6 @@ func cloneCaptchaSettings(src *captchaSettingsResponse) *captchaSettingsResponse
 	return cloned
 }
 
-// expandCaptchaSettings expands raw captcha settings into a slice
 func expandCaptchaSettings(raw interface{}) ([]interface{}, bool) {
 	switch value := raw.(type) {
 	case nil:
@@ -792,7 +489,6 @@ func expandCaptchaSettings(raw interface{}) ([]interface{}, bool) {
 	return nil, false
 }
 
-// normalizeCaptchaSettings normalizes captcha settings to string
 func normalizeCaptchaSettings(raw interface{}) (string, error) {
 	switch value := raw.(type) {
 	case nil:
@@ -808,7 +504,6 @@ func normalizeCaptchaSettings(raw interface{}) (string, error) {
 	}
 }
 
-// parseCaptchaCheckResult parses captcha check result from API response
 func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
@@ -826,7 +521,6 @@ func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, 
 	return result, nil
 }
 
-// parseSliderCaptchaContentResponse parses slider captcha content from API response
 func parseSliderCaptchaContentResponse(resp map[string]interface{}) (*sliderCaptchaContent, error) {
 	respObj, ok := resp["response"].(map[string]interface{})
 	if !ok {
@@ -877,7 +571,6 @@ func parseSliderCaptchaContentResponse(resp map[string]interface{}) (*sliderCapt
 	}, nil
 }
 
-// parseIntSlice parses a slice of integers from interface{}
 func parseIntSlice(raw []interface{}) ([]int, error) {
 	values := make([]int, 0, len(raw))
 	for _, item := range raw {
@@ -890,7 +583,6 @@ func parseIntSlice(raw []interface{}) ([]int, error) {
 	return values, nil
 }
 
-// parseIntValue parses a single integer from interface{}
 func parseIntValue(raw interface{}) (int, error) {
 	switch value := raw.(type) {
 	case float64:
@@ -908,7 +600,6 @@ func parseIntValue(raw interface{}) (int, error) {
 	}
 }
 
-// parseSliderSteps parses slider steps into size, swaps, and attempts
 func parseSliderSteps(steps []int) (int, []int, int, error) {
 	if len(steps) < 3 {
 		return 0, nil, 0, fmt.Errorf("slider steps payload too short")
@@ -935,7 +626,6 @@ func parseSliderSteps(steps []int) (int, []int, int, error) {
 	return size, remaining, attempts, nil
 }
 
-// decodeSliderImage decodes base64-encoded slider image
 func decodeSliderImage(rawImage string) (image.Image, error) {
 	decoded, err := base64.StdEncoding.DecodeString(rawImage)
 	if err != nil {
@@ -950,7 +640,6 @@ func decodeSliderImage(rawImage string) (image.Image, error) {
 	return img, nil
 }
 
-// encodeSliderAnswer encodes slider answer to base64 JSON
 func encodeSliderAnswer(activeSteps []int) (string, error) {
 	payload := struct {
 		Value []int `json:"value"`
@@ -966,7 +655,6 @@ func encodeSliderAnswer(activeSteps []int) (string, error) {
 	return base64.StdEncoding.EncodeToString(data), nil
 }
 
-// buildSliderActiveSteps builds active steps for a candidate
 func buildSliderActiveSteps(swaps []int, candidateIndex int) []int {
 	if candidateIndex <= 0 {
 		return []int{}
@@ -980,14 +668,13 @@ func buildSliderActiveSteps(swaps []int, candidateIndex int) []int {
 	return append([]int(nil), swaps[:end]...)
 }
 
-// buildSliderTileMapping builds tile mapping for a candidate
 func buildSliderTileMapping(gridSize int, activeSteps []int) ([]int, error) {
 	tileCount := gridSize * gridSize
 	if tileCount <= 0 {
 		return nil, fmt.Errorf("invalid slider tile count: %d", tileCount)
 	}
 	if len(activeSteps)%2 != 0 {
-		return nil, fmt.Errorf("invalid active steps length: %d", len(activeSteps) / 2)
+		return nil, fmt.Errorf("invalid active steps length: %d", len(activeSteps))
 	}
 
 	mapping := make([]int, tileCount)
@@ -1007,7 +694,6 @@ func buildSliderTileMapping(gridSize int, activeSteps []int) ([]int, error) {
 	return mapping, nil
 }
 
-// rankSliderCandidates ranks slider candidates by score
 func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderCandidate, error) {
 	candidateCount := len(swaps) / 2
 	if candidateCount == 0 {
@@ -1044,7 +730,6 @@ func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderC
 	return candidates, nil
 }
 
-// scoreSliderCandidate scores a slider candidate
 func scoreSliderCandidate(img image.Image, gridSize int, mapping []int) (int64, error) {
 	rendered, err := renderSliderCandidate(img, gridSize, mapping)
 	if err != nil {
@@ -1054,7 +739,6 @@ func scoreSliderCandidate(img image.Image, gridSize int, mapping []int) (int64, 
 	return scoreRenderedSliderImage(rendered, gridSize), nil
 }
 
-// renderSliderCandidate renders a slider candidate image
 func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image.RGBA, error) {
 	if gridSize <= 0 {
 		return nil, fmt.Errorf("invalid grid size: %d", gridSize)
@@ -1076,7 +760,6 @@ func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image
 	return rendered, nil
 }
 
-// scoreRenderedSliderImage scores a rendered slider image
 func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
 	bounds := img.Bounds()
 	var score int64
@@ -1112,7 +795,6 @@ func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
 	return score
 }
 
-// sliderTileRect returns the rectangle for a tile
 func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Rectangle {
 	row := index / gridSize
 	col := index % gridSize
@@ -1125,7 +807,6 @@ func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Recta
 	return image.Rect(x0, y0, x1, y1)
 }
 
-// copyScaledTile copies a scaled tile
 func copyScaledTile(dst *image.RGBA, dstRect image.Rectangle, src image.Image, srcRect image.Rectangle) {
 	if dstRect.Empty() || srcRect.Empty() {
 		return
@@ -1145,7 +826,6 @@ func copyScaledTile(dst *image.RGBA, dstRect image.Rectangle, src image.Image, s
 	}
 }
 
-// pixelDiff calculates pixel difference
 func pixelDiff(left color.Color, right color.Color) int64 {
 	lr, lg, lb, _ := left.RGBA()
 	rr, rg, rb, _ := right.RGBA()
@@ -1153,7 +833,6 @@ func pixelDiff(left color.Color, right color.Color) int64 {
 	return absDiff(lr, rr) + absDiff(lg, rg) + absDiff(lb, rb)
 }
 
-// absDiff calculates absolute difference
 func absDiff(left uint32, right uint32) int64 {
 	if left > right {
 		return int64(left - right)
@@ -1161,12 +840,10 @@ func absDiff(left uint32, right uint32) int64 {
 	return int64(right - left)
 }
 
-// generateSliderCursor generates a fake slider cursor
 func generateSliderCursor(candidateIndex int, candidateCount int) string {
 	return buildSliderCursor(candidateIndex, candidateCount, time.Now().Add(-220*time.Millisecond).UnixMilli())
 }
 
-// buildSliderCursor builds a fake slider cursor
 func buildSliderCursor(candidateIndex int, candidateCount int, startTime int64) string {
 	if candidateCount <= 0 {
 		return "[]"
@@ -1200,7 +877,6 @@ func buildSliderCursor(candidateIndex int, candidateCount int, startTime int64) 
 	return string(data)
 }
 
-// trySliderCaptchaCandidates tries slider captcha candidates
 func trySliderCaptchaCandidates(
 	candidates []sliderCandidate,
 	maxAttempts int,
@@ -1237,7 +913,6 @@ func trySliderCaptchaCandidates(
 	return "", fmt.Errorf("slider guesses exhausted")
 }
 
-// minInt returns the minimum of two integers
 func minInt(left int, right int) int {
 	if left < right {
 		return left
@@ -1245,7 +920,6 @@ func minInt(left int, right int) int {
 	return right
 }
 
-// describeCaptchaTypes describes available captcha types
 func describeCaptchaTypes(settingsByType map[string]string) string {
 	if len(settingsByType) == 0 {
 		return "none"
@@ -1257,9 +931,4 @@ func describeCaptchaTypes(settingsByType map[string]string) string {
 	}
 	sort.Strings(types)
 	return strings.Join(types, ",")
-}
-
-// randInt63 generates a random int63
-func randInt63() int64 {
-	return rand.Int63()
 }
