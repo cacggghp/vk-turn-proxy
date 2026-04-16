@@ -69,6 +69,10 @@ jobs:
             goarch: arm64
             cgo: 1
             api: 21
+          - goos: android
+            goarch: arm
+            cgo: 1
+            api: 21
           # you can add more (android/arm, windows, etc.) later
 
     steps:

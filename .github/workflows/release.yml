@@ -27,6 +27,21 @@ jobs:
             goarch: arm
             goarm: '7'
             cgo: 0
+          - goos: linux
+            goarch: mipsle
+            gomips: softfloat
+            cgo: 0
+          - goos: linux
+            goarch: mips
+            gomips: softfloat
+            cgo: 0
+          - goos: linux
+            goarch: mips64le
+            gomips: softfloat
+            cgo: 0
+          - goos: linux
+            goarch: riscv64
+            cgo: 0            
           - goos: darwin
             goarch: amd64
             cgo: 0
@@ -35,12 +50,19 @@ jobs:
             cgo: 0
           - goos: windows
             goarch: amd64
+            cgo: 0
+          - goos: windows
+            goarch: arm64
             cgo: 0
           - goos: windows
             goarch: 386
             cgo: 0
           - goos: android
             goarch: arm64
+            cgo: 1
+            api: 21
+          - goos: android
+            goarch: arm
             cgo: 1
             api: 21
           - goos: freebsd
@@ -69,6 +91,7 @@ jobs:
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOMIPS: ${{ matrix.gomips }}
           GOARM: ${{ matrix.goarm }}
           CGO_ENABLED: ${{ matrix.cgo }}
           ANDROID_API: ${{ matrix.api }}
@@ -87,6 +110,8 @@ jobs:
 
             if [ "$GOARCH" = "arm64" ]; then
               export CC="$TOOLCHAIN_BIN/aarch64-linux-android${ANDROID_API}-clang"
+            elif [ "$GOARCH" = "arm" ]; then
+              export CC="$TOOLCHAIN_BIN/armv7a-linux-androideabi${ANDROID_API}-clang"
             else
               echo "Unsupported ANDROID GOARCH=$GOARCH"
               exit 1
@@ -104,12 +129,12 @@ jobs:
             EXT=
           fi
 
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
+          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/client-${GOOS}-${GOARCH}${EXT}" \
             ./client
           
-          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM \
+          GOOS=$GOOS GOARCH=$GOARCH GOARM=$GOARM GOMIPS=$GOMIPS \
           go build -ldflags "-s -w -checklinkname=0" -trimpath \
             -o "dist/server-${GOOS}-${GOARCH}${EXT}" \
             ./server
