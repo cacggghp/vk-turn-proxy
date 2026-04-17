@@ -32,7 +32,6 @@ import (
 	tlsclient "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
 
-	"github.com/bschaatsbergen/dnsdialer"
 	"github.com/cacggghp/vk-turn-proxy/tcputil"
 	"github.com/cbeuw/connutil"
 	"github.com/google/uuid"
@@ -247,27 +246,26 @@ func generateFakeCursor() string {
 	return "[" + strings.Join(points, ",") + "]"
 }
 
-func getCustomNetDialer() net.Dialer {
-	return net.Dialer{
-		Timeout:   20 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Resolver: &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				var d net.Dialer
-				dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
-				var lastErr error
-				for _, dns := range dnsServers {
-					conn, err := d.DialContext(ctx, "udp", dns)
-					if err == nil {
-						return conn, nil
-					}
-					lastErr = err
-				}
-				return nil, lastErr
-			},
-		},
-	}
+// dnsMode is set in main() from the -dns flag and consumed by appDialer().
+var dnsMode = DNSModeAuto
+
+// dohResolverSingleton is shared across all callers of appDialer().
+var (
+	dohResolverOnce     sync.Once
+	dohResolverInstance *DohResolver
+)
+
+func sharedDohResolver() *DohResolver {
+	dohResolverOnce.Do(func() {
+		dohResolverInstance = NewDohResolver(nil)
+	})
+	return dohResolverInstance
+}
+
+// appDialer returns the net.Dialer used by tls-client and other HTTP callers.
+// DNS transport is selected by the -dns flag (udp | doh | auto).
+func appDialer() net.Dialer {
+	return buildDialer(dnsMode, sharedDohResolver())
 }
 
 // endregion
@@ -710,7 +708,7 @@ func (c *StreamCredentialsCache) invalidate(streamID int) {
 	log.Printf("[STREAM %d] [VK Auth] Credentials cache invalidated", streamID)
 }
 
-func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func getVkCredsCached(ctx context.Context, link string, streamID int) (string, string, string, error) {
 	cache := getStreamCache(streamID)
 	cacheID := getCacheID(streamID)
 
@@ -734,7 +732,7 @@ func getVkCredsCached(ctx context.Context, link string, streamID int, dialer *dn
 		return cache.creds.Username, cache.creds.Password, cache.creds.ServerAddr, nil
 	}
 
-	user, pass, addr, err := fetchVkCredsSerialized(ctx, link, streamID, dialer)
+	user, pass, addr, err := fetchVkCredsSerialized(ctx, link, streamID)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -748,7 +746,7 @@ var (
 	globalLastVkFetchTime time.Time
 )
 
-func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func fetchVkCredsSerialized(ctx context.Context, link string, streamID int) (string, string, string, error) {
 	vkRequestMu.Lock()
 	defer vkRequestMu.Unlock()
 
@@ -770,10 +768,10 @@ func fetchVkCredsSerialized(ctx context.Context, link string, streamID int, dial
 		globalLastVkFetchTime = time.Now()
 	}()
 
-	return fetchVkCreds(ctx, link, streamID, dialer)
+	return fetchVkCreds(ctx, link, streamID)
 }
 
-func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdialer.Dialer) (string, string, string, error) {
+func fetchVkCreds(ctx context.Context, link string, streamID int) (string, string, string, error) {
 	// Check Global Lockout to prevent API bans
 	if time.Now().Unix() < globalCaptchaLockout.Load() {
 		return "", "", "", fmt.Errorf("CAPTCHA_WAIT_REQUIRED: global lockout active")
@@ -785,7 +783,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	for _, creds := range vkCredentialsList {
 		log.Printf("[STREAM %d] [VK Auth] Trying credentials: client_id=%s", streamID, creds.ClientID)
 
-		user, pass, addr, err := getTokenChain(ctx, link, streamID, creds, dialer, jar)
+		user, pass, addr, err := getTokenChain(ctx, link, streamID, creds, jar)
 
 		if err == nil {
 			log.Printf("[STREAM %d] [VK Auth] Success with client_id=%s", streamID, creds.ClientID)
@@ -808,7 +806,7 @@ func fetchVkCreds(ctx context.Context, link string, streamID int, dialer *dnsdia
 	return "", "", "", fmt.Errorf("all VK credentials failed: %w", lastErr)
 }
 
-func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, dialer *dnsdialer.Dialer, jar tlsclient.CookieJar) (string, string, string, error) {
+func getTokenChain(ctx context.Context, link string, streamID int, creds VKCredentials, jar tlsclient.CookieJar) (string, string, string, error) {
 	profile := Profile{
 		UserAgent:       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
 		SecChUa:         `"Not(A:Brand";v="99", "Google Chrome";v="146", "Chromium";v="146"`,
@@ -820,7 +818,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		tlsclient.WithTimeoutSeconds(20),
 		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(jar),
-		tlsclient.WithDialer(getCustomNetDialer()),
+		tlsclient.WithDialer(appDialer()),
 	)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
@@ -969,7 +967,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						var t, k string
 						var e error
 						if captchaErr.RedirectURI != "" {
-							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI, dialer)
+							t, e = solveCaptchaViaProxy(captchaErr.RedirectURI)
 						} else if captchaErr.CaptchaImg != "" {
 							k, e = solveCaptchaViaHTTP(captchaErr.CaptchaImg)
 						} else {
@@ -1077,6 +1075,7 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 	if !ok || len(urlsRaw) == 0 {
 		return "", "", "", fmt.Errorf("missing or empty urls in turn_server")
 	}
+	log.Printf("[STREAM %d] [VK Auth] turn_server urls: %v", streamID, urlsRaw)
 	urlStr, ok := urlsRaw[0].(string)
 	if !ok {
 		return "", "", "", fmt.Errorf("turn server url is not a string")
@@ -1209,10 +1208,12 @@ func getYandexCreds(link string) (string, string, string, error) {
 	}
 
 	endpoint := "https://" + telemostConfHost + telemostConfPath
+	appD := appDialer()
 	tr := &http.Transport{
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 100,
 		IdleConnTimeout:     90 * time.Second,
+		DialContext:         appD.DialContext,
 	}
 	client := &http.Client{
 		Timeout:   20 * time.Second,
@@ -1264,7 +1265,8 @@ func getYandexCreds(link string) (string, string, string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	dialer := websocket.Dialer{}
+	wsAppD := appDialer()
+	dialer := websocket.Dialer{NetDialContext: wsAppD.DialContext}
 	var conn *websocket.Conn
 	conn, resp, err = dialer.DialContext(ctx, data.Wss, h)
 	if err != nil {
@@ -1553,6 +1555,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 	var turnServerAddr string
 	turnServerAddr = net.JoinHostPort(urlhost, urlport)
+	log.Printf("[STREAM %d] [TURN] dialing %s (udp=%v)", streamID, turnServerAddr, turnParams.udp)
 	turnServerUDPAddr, err1 := net.ResolveUDPAddr("udp", turnServerAddr)
 	if err1 != nil {
 		err = fmt.Errorf("failed to resolve TURN server address: %s", err1)
@@ -1812,7 +1815,15 @@ func main() {
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+	dnsFlag := flag.String("dns", DNSModeAuto, "DNS resolution mode: udp | doh | auto (auto tries UDP/53 first, sticky-fallback to DoH on total failure)")
 	flag.Parse()
+	switch *dnsFlag {
+	case DNSModeUDP, DNSModeDoH, DNSModeAuto:
+		dnsMode = *dnsFlag
+	default:
+		log.Panicf("invalid -dns value %q (expected udp|doh|auto)", *dnsFlag)
+	}
+	log.Printf("[DNS] mode=%s", dnsMode)
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
@@ -1834,14 +1845,8 @@ func main() {
 		parts := strings.Split(*vklink, "join/")
 		link = parts[len(parts)-1]
 
-		dialer := dnsdialer.New(
-			dnsdialer.WithResolvers("77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"),
-			dnsdialer.WithStrategy(dnsdialer.Fallback{}),
-			dnsdialer.WithCache(100, 10*time.Hour, 10*time.Hour),
-		)
-
 		getCreds = func(ctx context.Context, s string, streamID int) (string, string, string, error) {
-			return getVkCredsCached(ctx, s, streamID, dialer)
+			return getVkCredsCached(ctx, s, streamID)
 		}
 		if *n <= 0 {
 			*n = 10
