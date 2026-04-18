@@ -495,7 +495,7 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 	fmt.Println("==============================================")
 	fmt.Println()
 
-	log.Printf("[%s] Opening browser: %s", logPrefix, captchaURL)
+	log.Printf("[%s] Opening browser...", logPrefix)
 	openBrowser(captchaURL)
 
 	key := <-keyCh
@@ -554,6 +554,52 @@ button{font-size:24px;padding:12px 32px;margin-top:12px;cursor:pointer}</style>
 	return runCaptchaServerAndWait(mux, localCaptchaOrigin(), keyCh, "captcha HTTP server error")
 }
 
+type loggingTransport struct {
+	rt http.RoundTripper
+}
+
+func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	isCaptchaRequest := req.Body != nil && (strings.Contains(req.URL.Path, "captchaNotRobot.check") || strings.Contains(req.URL.Path, "captchaNotRobot.componentDone"))
+	
+	if isCaptchaRequest {
+		b, _ := io.ReadAll(req.Body)
+		req.Body = io.NopCloser(bytes.NewReader(b))
+
+		if isDebug {
+			log.Printf("[Captcha Proxy] Real browser sent %s data: %s", req.URL.Path, string(b))
+			for k, v := range req.Header {
+				log.Printf("[Captcha Proxy] Header (%s): %s = %s", req.URL.Path, k, strings.Join(v, ", "))
+			}
+		}
+
+		if strings.Contains(req.URL.Path, "captchaNotRobot.componentDone") || strings.Contains(req.URL.Path, "captchaNotRobot.check") {
+			parsedBody, _ := neturl.ParseQuery(string(b))
+			device := parsedBody.Get("device")
+			browserFp := parsedBody.Get("browser_fp")
+
+			// We only save it if device is present. componentDone usually has it.
+			if device != "" && browserFp != "" {
+				sp := SavedProfile{
+					Profile: Profile{
+						UserAgent:       req.Header.Get("User-Agent"),
+						SecChUa:         req.Header.Get("Sec-Ch-Ua"),
+						SecChUaMobile:   req.Header.Get("Sec-Ch-Ua-Mobile"),
+						SecChUaPlatform: req.Header.Get("Sec-Ch-Ua-Platform"),
+					},
+					DeviceJSON: device,
+					BrowserFp:  browserFp,
+				}
+				if err := SaveProfileToDisk(sp); err != nil {
+					log.Printf("[Captcha Proxy] Failed to save browser profile: %v", err)
+				} else {
+					log.Printf("[Captcha Proxy] Successfully intercepted and saved real browser profile!")
+				}
+			}
+		}
+	}
+	return t.rt.RoundTrip(req)
+}
+
 func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string, error) {
 	keyCh := make(chan string, 1)
 
@@ -562,7 +608,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 		return "", fmt.Errorf("invalid redirect URI: %v", err)
 	}
 
-	transport := newCaptchaProxyTransport(dialer)
+	transport := &loggingTransport{rt: newCaptchaProxyTransport(dialer)}
 
 	proxy := &httputil.ReverseProxy{
 		Transport: transport,
@@ -580,7 +626,7 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 
 			if res.StatusCode >= 300 && res.StatusCode < 400 {
 				if loc := res.Header.Get("Location"); loc != "" {
-					log.Printf("[Captcha Proxy] Redirecting to: %s", loc)
+					// Don't log the full redirect URL to keep console clean
 					if rewritten, ok := rewriteProxyRedirectLocation(loc, targetURL); ok {
 						res.Header.Set("Location", rewritten)
 					} else {
@@ -591,7 +637,9 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 
 			contentType := res.Header.Get("Content-Type")
 			contentEncoding := res.Header.Get("Content-Encoding")
-			log.Printf("[Captcha Proxy] %s %d | Content-Type: %q, Encoding: %q", res.Request.Method, res.StatusCode, contentType, contentEncoding)
+			if isDebug {
+				log.Printf("[Captcha Proxy] %s %d | Content-Type: %q, Encoding: %q", res.Request.Method, res.StatusCode, contentType, contentEncoding)
+			}
 
 			shouldInspectBody := strings.Contains(contentType, "text/html") ||
 				strings.Contains(contentType, "application/xhtml+xml") ||
@@ -723,9 +771,9 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("[Captcha Proxy] HTTP %s %s", r.Method, r.URL.String())
+		log.Printf("[Captcha Proxy] HTTP %s %s", r.Method, r.URL.Path)
 		if r.URL.Path == "/" && targetURL.Path != "" && targetURL.Path != "/" && r.URL.RawQuery == "" {
-			log.Printf("[Captcha Proxy] Redirecting ROOT to: %s", localCaptchaURLForTarget(targetURL))
+			// Don't log the full redirect URL to keep console clean
 			http.Redirect(w, r, localCaptchaURLForTarget(targetURL), http.StatusTemporaryRedirect)
 			return
 		}
