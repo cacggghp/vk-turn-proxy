@@ -962,7 +962,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					}
 				case captchaSolveModeManual:
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
-					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
+					// Use context.Background() so that a short deadline on the parent ctx
+					// (e.g. the overall auth timeout) doesn't cut the user's solve time short.
+					manualCtx, manualCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 
 					type manualRes struct {
 						token string
@@ -989,8 +991,24 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						successToken = res.token
 						captchaKey = res.key
 						solveErr = res.err
+						// Token may be present even when err != nil (e.g. srv.Shutdown
+						// timed out on iSH after the token was already received).
+						// Treat a non-empty token as success regardless of the error.
+						if successToken != "" || captchaKey != "" {
+							if solveErr != nil {
+								log.Printf("[STREAM %d] [Captcha] Token received (ignoring cleanup error: %v)", streamID, solveErr)
+								solveErr = nil
+							}
+							log.Printf("[STREAM %d] [Captcha] Successfully got token from browser", streamID)
+						} else if solveErr != nil {
+							log.Printf("[STREAM %d] [Captcha] solveCaptchaViaProxy returned error: %v", streamID, solveErr)
+						}
 					case <-manualCtx.Done():
-						solveErr = fmt.Errorf("manual captcha timed out after 60s")
+						if manualCtx.Err() == context.DeadlineExceeded {
+							solveErr = fmt.Errorf("manual captcha timed out after 3m")
+						} else {
+							solveErr = fmt.Errorf("manual captcha interrupted: %w", manualCtx.Err())
+						}
 					}
 					manualCancel()
 				}
@@ -1791,7 +1809,7 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 
 func setupGlobalResolver() {
 	dialer := &net.Dialer{
-		Timeout:   5 * time.Second,
+		Timeout:   10 * time.Second,
 		KeepAlive: 30 * time.Second,
 	}
 	dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}

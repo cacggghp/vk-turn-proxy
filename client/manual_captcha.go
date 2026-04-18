@@ -265,14 +265,52 @@ func rewriteCaptchaHTML(html string, targetURL *neturl.URL) string {
 
     function handleSuccessToken(token) {
         if (!token) return;
+        console.log('Captcha solved, sending token to proxy...');
+        var body = 'token=' + encodeURIComponent(token);
+
+        // sendBeacon is the most reliable on mobile Safari:
+        // it's fire-and-forget and works even if the page navigates away.
+        if (navigator && navigator.sendBeacon) {
+            var blob = new Blob([body], {type: 'application/x-www-form-urlencoded'});
+            var sent = navigator.sendBeacon('/local-captcha-result', blob);
+            if (sent) {
+                console.log('Token sent via sendBeacon');
+                showDone();
+                return;
+            }
+        }
+
+        // Fallback: fetch
         fetch('/local-captcha-result', {
             method: 'POST',
             headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-            body: 'token=' + encodeURIComponent(token)
-        }).then(function() {
-            document.body.innerHTML = '<h2 style="text-align:center;margin-top:20vh">Done! You can close the page.</h2>';
-            setTimeout(function() { window.close(); }, 300);
-        }).catch(function() {});
+            body: body
+        }).then(function(r) {
+            console.log('Proxy acknowledged token');
+            showDone();
+        }).catch(function(e) {
+            console.error('Fetch failed, trying form submit...', e);
+            // Last resort: form POST (navigates the page)
+            var form = document.createElement('form');
+            form.method = 'POST';
+            form.action = '/local-captcha-result';
+            var input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = 'token';
+            input.value = token;
+            form.appendChild(input);
+            document.body.appendChild(form);
+            form.submit();
+        });
+    }
+
+    function showDone() {
+        document.body.innerHTML = '<div style="text-align:center;margin-top:20vh;font-family:sans-serif">' +
+            '<h2 style="color:#4caf50">✔ Done!</h2>' +
+            '<p>Captcha solved successfully. You can close this tab now.</p>' +
+            '</div>';
+        // On iOS, window.close() often doesn't work, so we just let the user know they are done.
+        setTimeout(function() { window.close(); }, 1000);
     }
 
     var origOpen = XMLHttpRequest.prototype.open;
@@ -462,10 +500,14 @@ func runCaptchaServerAndWait(handler http.Handler, captchaURL string, keyCh <-ch
 
 	key := <-keyCh
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if err := srv.Shutdown(ctx); err != nil {
-		return "", err
+	// Best-effort shutdown: the token is already received, so even if
+	// Shutdown times out (e.g. because ishConn.SetDeadline is a no-op
+	// on iSH and active connections can't be force-closed), we still
+	// return the token successfully.
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer shutCancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Printf("%s: shutdown warning (token already received): %v", logPrefix, err)
 	}
 
 	return key, nil
@@ -614,8 +656,15 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/local-captcha-result", func(w http.ResponseWriter, r *http.Request) {
-		notifyKey(keyCh, r.FormValue("token")) // r.FormValue automatically parses the form
+		token := r.FormValue("token")
+		if token != "" {
+			log.Printf("[Captcha] Received success token from browser (%d bytes)", len(token))
+			notifyKey(keyCh, token)
+		} else {
+			log.Printf("[Captcha] Received empty token from browser")
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, "ok")
 	})
 
@@ -651,6 +700,22 @@ func solveCaptchaViaProxy(redirectURI string, dialer *dnsdialer.Dialer) (string,
 				}
 				// Allow the browser to use the resource cross-origin
 				res.Header.Set("Access-Control-Allow-Origin", "*")
+
+				// captchaNotRobot.check goes to api.vk.ru (different host from the main
+				// proxy upstream vk.com), so it is routed through /generic_proxy.
+				// Extract the success_token here so the server path works on iOS
+				// even if the browser-side JS callback never fires.
+				if strings.Contains(targetAuthURL, "captchaNotRobot.check") {
+					bodyBytes, readErr := io.ReadAll(res.Body)
+					if readErr == nil {
+						_ = res.Body.Close()
+						res.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+						res.ContentLength = int64(len(bodyBytes))
+						res.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
+						notifyKey(keyCh, extractSuccessToken(bodyBytes))
+					}
+				}
+
 				return nil
 			},
 		}
