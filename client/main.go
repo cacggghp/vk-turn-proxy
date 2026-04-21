@@ -2025,7 +2025,7 @@ func main() {
 	case <-ctx.Done():
 	}
 
-	for i := 1; i < numStreams; i++ {
+	for i := 2; i <= numStreams; i++ {
 		cchan := make(chan net.PacketConn)
 		wg1.Add(1)
 		go func(streamID int) {
