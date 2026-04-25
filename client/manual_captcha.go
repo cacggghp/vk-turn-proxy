@@ -171,6 +171,12 @@ var htmlURLAttrDoubleRe = regexp.MustCompile(`(?i)((?:src|href|action)\s*=\s*)"(
 // htmlURLAttrSingleRe matches src/href/action attributes with single-quoted absolute or protocol-relative URLs.
 var htmlURLAttrSingleRe = regexp.MustCompile(`(?i)((?:src|href|action)\s*=\s*)'((?:https?:)?//[^']+)'`)
 
+// htmlScriptContentRe matches <script> tags to extract their content.
+var htmlScriptContentRe = regexp.MustCompile(`(?is)(<script[^>]*>)(.*?)(</script>)`)
+
+// htmlStyleContentRe matches <style> tags to extract their content.
+var htmlStyleContentRe = regexp.MustCompile(`(?is)(<style[^>]*>)(.*?)(</style>)`)
+
 // rewriteHTMLAttrsServerSide rewrites absolute and protocol-relative URLs in src/href/action
 // attributes of raw HTML. URLs matching the upstream origin are redirected to localhost;
 // all other absolute URLs are routed through /generic_proxy so that cross-domain resources
@@ -196,6 +202,28 @@ func rewriteHTMLAttrsServerSide(html string, targetURL *neturl.URL) string {
 		return "/generic_proxy?proxy_url=" + neturl.QueryEscape(absURL)
 	}
 
+	var placeholders = make(map[string]string)
+
+	html = htmlScriptContentRe.ReplaceAllStringFunc(html, func(match string) string {
+		groups := htmlScriptContentRe.FindStringSubmatch(match)
+		if len(groups) < 4 {
+			return match
+		}
+		id := fmt.Sprintf("@@CONTENT_%d@@", len(placeholders))
+		placeholders[id] = groups[2]
+		return groups[1] + id + groups[3]
+	})
+
+	html = htmlStyleContentRe.ReplaceAllStringFunc(html, func(match string) string {
+		groups := htmlStyleContentRe.FindStringSubmatch(match)
+		if len(groups) < 4 {
+			return match
+		}
+		id := fmt.Sprintf("@@CONTENT_%d@@", len(placeholders))
+		placeholders[id] = groups[2]
+		return groups[1] + id + groups[3]
+	})
+
 	html = htmlURLAttrDoubleRe.ReplaceAllStringFunc(html, func(match string) string {
 		groups := htmlURLAttrDoubleRe.FindStringSubmatch(match)
 		if len(groups) < 3 {
@@ -211,6 +239,10 @@ func rewriteHTMLAttrsServerSide(html string, targetURL *neturl.URL) string {
 		}
 		return groups[1] + `'` + rewriteURL(groups[2]) + `'`
 	})
+
+	for id, content := range placeholders {
+		html = strings.Replace(html, id, content, 1)
+	}
 
 	return html
 }
