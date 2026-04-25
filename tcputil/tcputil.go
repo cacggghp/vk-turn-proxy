@@ -84,9 +84,9 @@ func NewKCPOverDTLS(dtlsConn net.Conn, isServer bool) (*kcp.UDPSession, error) {
 	// Tune KCP for TURN tunnel:
 	// - NoDelay mode for lower latency
 	// - Window sizes suitable for ~5Mbit/s
-	sess.SetNoDelay(1, 20, 2, 1) // nodelay, interval(ms), resend, nc
-	sess.SetWindowSize(256, 256)
-	sess.SetMtu(1200) // conservative MTU to fit inside DTLS+TURN
+	sess.SetNoDelay(1, 10, 2, 1) // nodelay, interval(ms), resend, nc
+	sess.SetWindowSize(4096, 4096)
+	sess.SetMtu(1280) // conservative MTU to fit inside DTLS+TURN
 	sess.SetACKNoDelay(true)
 
 	return sess, nil

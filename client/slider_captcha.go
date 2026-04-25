@@ -11,6 +11,7 @@ import (
 	_ "image/jpeg"
 	"io"
 	"log"
+	"math/rand"
 	neturl "net/url"
 	"regexp"
 	"sort"
@@ -23,7 +24,6 @@ import (
 )
 
 const (
-	captchaDebugInfo      = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
 )
@@ -36,6 +36,17 @@ type captchaNotRobotSession struct {
 	client       tlsclient.HttpClient
 	profile      Profile
 	browserFp    string
+	adFp         string
+	savedProfile *SavedProfile
+}
+
+func generateAdFp() string {
+	b := make([]byte, 16)
+	// simple random bytes (or any pseudo-random logic that matches the 21-char base64 footprint)
+	for i := range b {
+		b[i] = byte(rand.Intn(256))
+	}
+	return base64.RawURLEncoding.EncodeToString(b)[:21]
 }
 
 type captchaSettingsResponse struct {
@@ -68,14 +79,12 @@ type captchaBootstrap struct {
 	Settings   *captchaSettingsResponse
 }
 
-func newCaptchaNotRobotSession(
-	ctx context.Context,
-	sessionToken string,
-	hash string,
-	streamID int,
-	client tlsclient.HttpClient,
-	profile Profile,
-) *captchaNotRobotSession {
+func newCaptchaNotRobotSession(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile, savedProfile *SavedProfile) *captchaNotRobotSession {
+	browserFp := generateBrowserFp(profile)
+	if savedProfile != nil {
+		browserFp = savedProfile.BrowserFp
+	}
+
 	return &captchaNotRobotSession{
 		ctx:          ctx,
 		sessionToken: sessionToken,
@@ -83,7 +92,9 @@ func newCaptchaNotRobotSession(
 		streamID:     streamID,
 		client:       client,
 		profile:      profile,
-		browserFp:    generateBrowserFp(profile),
+		browserFp:    browserFp,
+		adFp:         generateAdFp(),
+		savedProfile: savedProfile,
 	}
 }
 
@@ -91,7 +102,7 @@ func (s *captchaNotRobotSession) baseValues() neturl.Values {
 	values := neturl.Values{}
 	values.Set("session_token", s.sessionToken)
 	values.Set("domain", "vk.com")
-	values.Set("adFp", "")
+	values.Set("adFp", s.adFp)
 	values.Set("access_token", "")
 	return values
 }
@@ -103,6 +114,16 @@ func (s *captchaNotRobotSession) request(method string, values neturl.Values) (m
 	if err != nil {
 		return nil, err
 	}
+
+	// Match the headers that the real VK captcha JS sends, same as callCaptchaNotRobot.
+	applyBrowserProfileFhttp(req, s.profile)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Origin", "https://api.vk.ru")
+	req.Header.Set("Referer", fmt.Sprintf("https://api.vk.ru/not_robot_captcha?domain=vk.com&session_token=%s&variant=popup&blank=1", s.sessionToken))
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
 
 	httpResp, err := s.client.Do(req)
 	if err != nil {
@@ -135,7 +156,12 @@ func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, er
 func (s *captchaNotRobotSession) requestComponentDone() error {
 	values := s.baseValues()
 	values.Set("browser_fp", s.browserFp)
-	values.Set("device", buildCaptchaDeviceJSON(s.profile))
+
+	deviceJSON := buildCaptchaDeviceJSON(s.profile)
+	if s.savedProfile != nil {
+		deviceJSON = s.savedProfile.DeviceJSON
+	}
+	values.Set("device", deviceJSON)
 
 	resp, err := s.request("captchaNotRobot.componentDone", values)
 	if err != nil {
@@ -144,8 +170,8 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 
 	respObj, ok := resp["response"].(map[string]interface{})
 	if ok {
-		if status, _ := respObj["status"].(string); status != "" && status != "OK" {
-			return fmt.Errorf("componentDone status: %s", status)
+		if statusVal, ok := respObj["status"].(string); ok && statusVal != "" && statusVal != "OK" {
+			return fmt.Errorf("componentDone status: %s", statusVal)
 		}
 	}
 
@@ -153,7 +179,7 @@ func (s *captchaNotRobotSession) requestComponentDone() error {
 }
 
 func (s *captchaNotRobotSession) requestCheckboxCheck() (*captchaCheckResult, error) {
-	return s.requestCheck(generateSliderCursor(0, 1), base64.StdEncoding.EncodeToString([]byte("{}")))
+	return s.requestCheck("[]", base64.StdEncoding.EncodeToString([]byte("{}")))
 }
 
 func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*sliderCaptchaContent, error) {
@@ -169,28 +195,68 @@ func (s *captchaNotRobotSession) requestSliderContent(sliderSettings string) (*s
 	return parseSliderCaptchaContentResponse(resp)
 }
 
+// requestSliderContentWithFallback tries to get slider content using multiple strategies:
+// first with the provided captcha_settings, then without it (and vice versa).
+// VK sometimes reports show_type=checkbox in settings but actually serves slider content,
+// so we need to probe both variants.
+func (s *captchaNotRobotSession) requestSliderContentWithFallback(sliderSettings string, streamID int) (*sliderCaptchaContent, error) {
+	type attempt struct {
+		settings string
+		desc     string
+	}
+	var attempts []attempt
+	if sliderSettings != "" {
+		attempts = []attempt{
+			{settings: sliderSettings, desc: "with captcha_settings"},
+			{settings: "", desc: "without captcha_settings"},
+		}
+	} else {
+		// We have no slider settings; just one attempt without captcha_settings
+		attempts = []attempt{
+			{settings: "", desc: "without captcha_settings"},
+		}
+	}
+
+	var lastErr error
+	for _, a := range attempts {
+		log.Printf("[STREAM %d] [Captcha] Requesting slider content (%s)...", streamID, a.desc)
+		content, err := s.requestSliderContent(a.settings)
+		if err == nil {
+			return content, nil
+		}
+		log.Printf("[STREAM %d] [Captcha] getContent failed (%s): %v", streamID, a.desc, err)
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func (s *captchaNotRobotSession) requestSliderCheck(activeSteps []int, candidateIndex int, candidateCount int) (*captchaCheckResult, error) {
 	answer, err := encodeSliderAnswer(activeSteps)
 	if err != nil {
 		return nil, err
 	}
 
-	return s.requestCheck(generateSliderCursor(candidateIndex, candidateCount), answer)
+	return s.requestCheck("[]", answer)
 }
 
 func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*captchaCheckResult, error) {
 	values := s.baseValues()
+
+	// The real browser sends a static SHA-256 hash for debug_info.
+	// We use the exact one captured from the real browser's session.
+	debugInfo := "f3ef768dab7a20f574c6461f34e4257894d2a3c30a53d8727a3edaf7ab70847d"
+
 	values.Set("accelerometer", "[]")
 	values.Set("gyroscope", "[]")
 	values.Set("motion", "[]")
 	values.Set("cursor", cursor)
 	values.Set("taps", "[]")
-	values.Set("connectionRtt", "[]")
-	values.Set("connectionDownlink", "[]")
+	values.Set("connectionRtt", "[250,250,250,250,250]")
+	values.Set("connectionDownlink", "[1.45,1.45,1.45,1.45,1.45]")
 	values.Set("browser_fp", s.browserFp)
 	values.Set("hash", s.hash)
 	values.Set("answer", answer)
-	values.Set("debug_info", captchaDebugInfo)
+	values.Set("debug_info", debugInfo)
 
 	resp, err := s.request("captchaNotRobot.check", values)
 	if err != nil {
@@ -214,8 +280,9 @@ func callCaptchaNotRobotWithSliderPOC(
 	client tlsclient.HttpClient,
 	profile Profile,
 	initialSettings *captchaSettingsResponse,
+	savedProfile *SavedProfile,
 ) (string, error) {
-	session := newCaptchaNotRobotSession(ctx, sessionToken, hash, streamID, client, profile)
+	session := newCaptchaNotRobotSession(ctx, sessionToken, hash, streamID, client, profile, savedProfile)
 
 	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	settingsResp, err := session.requestSettings()
@@ -227,7 +294,8 @@ func callCaptchaNotRobotWithSliderPOC(
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
-	if err := session.requestComponentDone(); err != nil {
+	err = session.requestComponentDone()
+	if err != nil {
 		return "", err
 	}
 
@@ -265,24 +333,25 @@ func callCaptchaNotRobotWithSliderPOC(
 		log.Printf("[STREAM %d] [Captcha] Trying experimental slider solver...", streamID)
 	}
 
-	sliderContent, err := session.requestSliderContent(sliderSettings)
+	// After check returns BOT, a real browser renders the slider widget and calls
+	// componentDone again to signal "slider component is now loaded". Without this,
+	// VK refuses getContent with ERROR because it expects the widget lifecycle.
+	log.Printf("[STREAM %d] [Captcha] Re-registering slider component before getContent...", streamID)
+	time.Sleep(300 * time.Millisecond)
+	err = session.requestComponentDone()
+	if err != nil {
+		// Non-fatal: log and continue — getContent may still succeed.
+		log.Printf("[STREAM %d] [Captcha] Warning: slider componentDone failed: %v", streamID, err)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	sliderContent, err := session.requestSliderContentWithFallback(sliderSettings, streamID)
 	if err != nil {
 		log.Printf(
-			"[STREAM %d] [Captcha] Slider getContent failed (status: %v). Trying to solve as a checkbox instead...",
+			"[STREAM %d] [Captcha] All slider getContent attempts failed: %v",
 			streamID,
 			err,
 		)
-		// Fallback: maybe it's just a checkbox that needs a human-like check
-		time.Sleep(300 * time.Millisecond)
-		finalCheck, err2 := session.requestCheckboxCheck()
-		if err2 == nil && finalCheck.Status == "OK" {
-			if finalCheck.SuccessToken == "" {
-				return "", fmt.Errorf("success_token not found in fallback check")
-			}
-			log.Printf("[STREAM %d] [Captcha] Fallback checkbox check succeeded!", streamID)
-			session.requestEndSession()
-			return finalCheck.SuccessToken, nil
-		}
 		return "", fmt.Errorf("check status: %s (slider getContent failed: %w)", initialCheck.Status, err)
 	}
 
@@ -317,8 +386,10 @@ func callCaptchaNotRobotWithSliderPOC(
 }
 
 func buildCaptchaDeviceJSON(profile Profile) string {
+	// Fallback device JSON if no saved profile is available.
+	// We include the User-Agent from the current profile to maintain some consistency.
 	return fmt.Sprintf(
-		`{"screenWidth":1920,"screenHeight":1080,"screenAvailWidth":1920,"screenAvailHeight":1040,"innerWidth":1920,"innerHeight":969,"devicePixelRatio":1,"language":"en-US","languages":["en-US"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"default","userAgent":"%s","platform":"Win32"}`,
+		`{"screenWidth":1536,"screenHeight":864,"screenAvailWidth":1536,"screenAvailHeight":816,"innerWidth":1536,"innerHeight":730,"devicePixelRatio":1.25,"language":"ru-RU","languages":["ru-RU","ru","en-US","en"],"webdriver":false,"hardwareConcurrency":8,"deviceMemory":8,"connectionEffectiveType":"4g","notificationsPermission":"prompt","userAgent":"%s"}`,
 		profile.UserAgent,
 	)
 }
@@ -332,7 +403,7 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 	settings := &captchaSettingsResponse{
 		SettingsByType: make(map[string]string),
 	}
-	settings.ShowCaptchaType, _ = respObj["show_captcha_type"].(string)
+	settings.ShowCaptchaType, _ = respObj["show_captcha_type"].(string) //nolint:errcheck
 
 	rawSettings, ok := expandCaptchaSettings(respObj["captcha_settings"])
 	if !ok {
@@ -345,7 +416,7 @@ func parseCaptchaSettingsResponse(resp map[string]interface{}) (*captchaSettings
 			continue
 		}
 
-		captchaType, _ := item["type"].(string)
+		captchaType, _ := item["type"].(string) //nolint:errcheck
 		if captchaType == "" {
 			continue
 		}
@@ -511,9 +582,9 @@ func parseCaptchaCheckResult(resp map[string]interface{}) (*captchaCheckResult, 
 	}
 
 	result := &captchaCheckResult{}
-	result.Status, _ = respObj["status"].(string)
-	result.SuccessToken, _ = respObj["success_token"].(string)
-	result.ShowCaptchaType, _ = respObj["show_captcha_type"].(string)
+	result.Status, _ = respObj["status"].(string)                     //nolint:errcheck
+	result.SuccessToken, _ = respObj["success_token"].(string)        //nolint:errcheck
+	result.ShowCaptchaType, _ = respObj["show_captcha_type"].(string) //nolint:errcheck
 	if result.Status == "" {
 		return nil, fmt.Errorf("check status missing: %v", resp)
 	}
@@ -527,18 +598,27 @@ func parseSliderCaptchaContentResponse(resp map[string]interface{}) (*sliderCapt
 		return nil, fmt.Errorf("invalid slider content response: %v", resp)
 	}
 
-	status, _ := respObj["status"].(string)
+	status, _ := respObj["status"].(string) //nolint:errcheck
 	if status != "OK" {
+		// Log all fields from the response to help diagnose why VK rejected getContent.
+		var debugFields []string
+		for k, v := range respObj {
+			if k != "image" { // skip base64 image blob
+				debugFields = append(debugFields, fmt.Sprintf("%s=%v", k, v))
+			}
+		}
+		sort.Strings(debugFields)
+		log.Printf("[Captcha] getContent ERROR response fields: %s", strings.Join(debugFields, " "))
 		return nil, fmt.Errorf("slider getContent status: %s", status)
 	}
 
-	extension, _ := respObj["extension"].(string)
+	extension, _ := respObj["extension"].(string) //nolint:errcheck
 	extension = strings.ToLower(extension)
 	if extension != "jpeg" && extension != "jpg" {
 		return nil, fmt.Errorf("unsupported slider image format: %s", extension)
 	}
 
-	rawImage, _ := respObj["image"].(string)
+	rawImage, _ := respObj["image"].(string) //nolint:errcheck
 	if rawImage == "" {
 		return nil, fmt.Errorf("slider image missing")
 	}
@@ -731,12 +811,70 @@ func rankSliderCandidates(img image.Image, gridSize int, swaps []int) ([]sliderC
 }
 
 func scoreSliderCandidate(img image.Image, gridSize int, mapping []int) (int64, error) {
-	rendered, err := renderSliderCandidate(img, gridSize, mapping)
-	if err != nil {
-		return 0, err
+	bounds := img.Bounds()
+	var score int64
+
+	for row := 0; row < gridSize; row++ {
+		for col := 0; col < gridSize-1; col++ {
+			dstLeftIndex := row*gridSize + col
+			dstRightIndex := row*gridSize + col + 1
+			srcLeftIndex := mapping[dstLeftIndex]
+			srcRightIndex := mapping[dstRightIndex]
+
+			dstLeftRect := sliderTileRect(bounds, gridSize, dstLeftIndex)
+			dstRightRect := sliderTileRect(bounds, gridSize, dstRightIndex)
+			srcLeftRect := sliderTileRect(bounds, gridSize, srcLeftIndex)
+			srcRightRect := sliderTileRect(bounds, gridSize, srcRightIndex)
+
+			height := minInt(dstLeftRect.Dy(), dstRightRect.Dy())
+
+			leftSrcXRel := (dstLeftRect.Dx() - 1) * srcLeftRect.Dx() / dstLeftRect.Dx()
+			sxLeft := srcLeftRect.Min.X + leftSrcXRel
+			sxRight := srcRightRect.Min.X
+
+			for offset := 0; offset < height; offset++ {
+				syLeft := srcLeftRect.Min.Y + offset*srcLeftRect.Dy()/dstLeftRect.Dy()
+				syRight := srcRightRect.Min.Y + offset*srcRightRect.Dy()/dstRightRect.Dy()
+
+				score += pixelDiff(
+					img.At(sxLeft, syLeft),
+					img.At(sxRight, syRight),
+				)
+			}
+		}
 	}
 
-	return scoreRenderedSliderImage(rendered, gridSize), nil
+	for row := 0; row < gridSize-1; row++ {
+		for col := 0; col < gridSize; col++ {
+			dstTopIndex := row*gridSize + col
+			dstBottomIndex := (row+1)*gridSize + col
+			srcTopIndex := mapping[dstTopIndex]
+			srcBottomIndex := mapping[dstBottomIndex]
+
+			dstTopRect := sliderTileRect(bounds, gridSize, dstTopIndex)
+			dstBottomRect := sliderTileRect(bounds, gridSize, dstBottomIndex)
+			srcTopRect := sliderTileRect(bounds, gridSize, srcTopIndex)
+			srcBottomRect := sliderTileRect(bounds, gridSize, srcBottomIndex)
+
+			width := minInt(dstTopRect.Dx(), dstBottomRect.Dx())
+
+			topSrcYRel := (dstTopRect.Dy() - 1) * srcTopRect.Dy() / dstTopRect.Dy()
+			syTop := srcTopRect.Min.Y + topSrcYRel
+			syBottom := srcBottomRect.Min.Y
+
+			for offset := 0; offset < width; offset++ {
+				sxTop := srcTopRect.Min.X + offset*srcTopRect.Dx()/dstTopRect.Dx()
+				sxBottom := srcBottomRect.Min.X + offset*srcBottomRect.Dx()/dstBottomRect.Dx()
+
+				score += pixelDiff(
+					img.At(sxTop, syTop),
+					img.At(sxBottom, syBottom),
+				)
+			}
+		}
+	}
+
+	return score, nil
 }
 
 func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image.RGBA, error) {
@@ -758,41 +896,6 @@ func renderSliderCandidate(img image.Image, gridSize int, mapping []int) (*image
 	}
 
 	return rendered, nil
-}
-
-func scoreRenderedSliderImage(img image.Image, gridSize int) int64 {
-	bounds := img.Bounds()
-	var score int64
-
-	for row := 0; row < gridSize; row++ {
-		for col := 0; col < gridSize-1; col++ {
-			leftRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			rightRect := sliderTileRect(bounds, gridSize, row*gridSize+col+1)
-			height := minInt(leftRect.Dy(), rightRect.Dy())
-			for offset := 0; offset < height; offset++ {
-				score += pixelDiff(
-					img.At(leftRect.Max.X-1, leftRect.Min.Y+offset),
-					img.At(rightRect.Min.X, rightRect.Min.Y+offset),
-				)
-			}
-		}
-	}
-
-	for row := 0; row < gridSize-1; row++ {
-		for col := 0; col < gridSize; col++ {
-			topRect := sliderTileRect(bounds, gridSize, row*gridSize+col)
-			bottomRect := sliderTileRect(bounds, gridSize, (row+1)*gridSize+col)
-			width := minInt(topRect.Dx(), bottomRect.Dx())
-			for offset := 0; offset < width; offset++ {
-				score += pixelDiff(
-					img.At(topRect.Min.X+offset, topRect.Max.Y-1),
-					img.At(bottomRect.Min.X+offset, bottomRect.Min.Y),
-				)
-			}
-		}
-	}
-
-	return score
 }
 
 func sliderTileRect(bounds image.Rectangle, gridSize int, index int) image.Rectangle {
@@ -840,6 +943,7 @@ func absDiff(left uint32, right uint32) int64 {
 	return int64(right - left)
 }
 
+/*
 func generateSliderCursor(candidateIndex int, candidateCount int) string {
 	return buildSliderCursor(candidateIndex, candidateCount, time.Now().Add(-220*time.Millisecond).UnixMilli())
 }
@@ -876,6 +980,7 @@ func buildSliderCursor(candidateIndex int, candidateCount int, startTime int64) 
 	}
 	return string(data)
 }
+*/
 
 func trySliderCaptchaCandidates(
 	candidates []sliderCandidate,

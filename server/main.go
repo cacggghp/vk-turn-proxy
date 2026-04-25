@@ -224,8 +224,8 @@ func handleVLESSConnection(ctx context.Context, dtlsConn net.Conn, connectAddr s
 		return
 	}
 	defer func() {
-		if err := kcpSess.Close(); err != nil {
-			log.Printf("failed to close KCP session: %v", err)
+		if closeErr := kcpSess.Close(); closeErr != nil {
+			log.Printf("failed to close KCP session: %v", closeErr)
 		}
 	}()
 	log.Printf("KCP session established (server)")
@@ -318,7 +318,11 @@ func pipeConn(ctx context.Context, c1, c2 net.Conn) {
 
 	wg.Wait()
 
-	// Reset deadlines
-	_ = c1.SetDeadline(time.Time{})
-	_ = c2.SetDeadline(time.Time{})
+	// Reset deadlines (best-effort; connection may already be closed)
+	if err := c1.SetDeadline(time.Time{}); err != nil {
+		log.Printf("pipeConn: failed to reset deadline c1: %v", err)
+	}
+	if err := c2.SetDeadline(time.Time{}); err != nil {
+		log.Printf("pipeConn: failed to reset deadline c2: %v", err)
+	}
 }

@@ -228,11 +228,14 @@ func applyBrowserProfileFhttp(req *fhttp.Request, profile Profile) {
 }
 
 func generateBrowserFp(profile Profile) string {
-	data := profile.UserAgent + profile.SecChUa + "1920x1080x24" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	// Fallback logic for generating a fingerprint if no saved profile is available.
+	// This uses a simple MD5 hash of UA and a fixed resolution.
+	data := profile.UserAgent + profile.SecChUa + "1536x864x24"
 	h := md5.Sum([]byte(data))
 	return hex.EncodeToString(h[:])
 }
 
+/*
 func generateFakeCursor() string {
 	startX := 600 + rand.Intn(400)
 	startY := 300 + rand.Intn(200)
@@ -246,6 +249,47 @@ func generateFakeCursor() string {
 	}
 	return "[" + strings.Join(points, ",") + "]"
 }
+
+// generateCheckboxCursor simulates a mouse moving from a random starting position
+// towards the VK captcha checkbox area, decelerating as it approaches the target.
+// This looks more like a real click than either a stationary cursor or pure random jitter.
+func generateCheckboxCursor() string {
+	type point struct {
+		X int   `json:"x"`
+		Y int   `json:"y"`
+		T int64 `json:"t"`
+	}
+
+	// Target is roughly where VK renders the checkbox
+	targetX := 290 + rand.Intn(20) - 10
+	targetY := 437 + rand.Intn(10) - 5
+
+	// Starting position: somewhere to the upper-right of the checkbox
+	startX := targetX + 200 + rand.Intn(300)
+	startY := targetY - 80 - rand.Intn(120)
+
+	steps := 14 + rand.Intn(6)
+	startTime := time.Now().Add(-time.Duration(400+rand.Intn(600)) * time.Millisecond).UnixMilli()
+
+	points := make([]point, 0, steps)
+	for i := 0; i < steps; i++ {
+		// Ease-out: fast at start, slow near target
+		t := float64(i) / float64(steps-1)
+		ease := 1 - (1-t)*(1-t)
+		x := startX + int(float64(targetX-startX)*ease) + rand.Intn(5) - 2
+		y := startY + int(float64(targetY-startY)*ease) + rand.Intn(5) - 2
+		dt := int64(15 + rand.Intn(25) + int(20*t)) // slower near target
+		startTime += dt
+		points = append(points, point{X: x, Y: y, T: startTime})
+	}
+
+	data, err := json.Marshal(points)
+	if err != nil {
+		return "[]"
+	}
+	return string(data)
+}
+*/
 
 func getCustomNetDialer() net.Dialer {
 	return net.Dialer{
@@ -328,7 +372,7 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		return nil
 	}
 
-	// Extract session token if redirect_uri present
+	// Extract session token
 	var sessionToken string
 	if RedirectURI != "" {
 		if parsed, err := neturl.Parse(RedirectURI); err == nil {
@@ -336,6 +380,12 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 		} else {
 			log.Printf("failed to parse redirect_uri: %v", err)
 			return nil
+		}
+	}
+	// Fallback to top-level session_token field if not in redirect_uri
+	if sessionToken == "" {
+		if st, stOk := errData["session_token"].(string); stOk {
+			sessionToken = st
 		}
 	}
 
@@ -393,6 +443,14 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 		return "", fmt.Errorf("no redirect_uri for auto-solve")
 	}
 
+	// Try to load saved profile from disk
+	var savedProfile *SavedProfile
+	if sp, err := LoadProfileFromDisk(); err == nil {
+		log.Printf("[STREAM %d] [Captcha] Using saved real browser profile", streamID)
+		savedProfile = sp
+		profile = sp.Profile // Use saved headers/UA
+	}
+
 	bootstrap, err := fetchCaptchaBootstrap(ctx, captchaErr.RedirectURI, client, profile)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch captcha bootstrap: %w", err)
@@ -413,9 +471,10 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 			client,
 			profile,
 			bootstrap.Settings,
+			savedProfile, // Pass savedProfile if available
 		)
 	} else {
-		successToken, err = callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, client, profile)
+		successToken, err = callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, client, profile, savedProfile)
 	}
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
@@ -472,7 +531,7 @@ func solvePoW(powInput string, difficulty int) string {
 	return ""
 }
 
-func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
+func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile, savedProfile *SavedProfile) (string, error) {
 	vkReq := func(method string, postData string) (map[string]interface{}, error) {
 		reqURL := "https://api.vk.ru/method/" + method + "?v=5.131"
 		parsedURL, err := neturl.Parse(reqURL)
@@ -490,13 +549,11 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		applyBrowserProfileFhttp(req, profile)
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Accept", "*/*")
-		req.Header.Set("Origin", "https://id.vk.ru")
-		req.Header.Set("Referer", "https://id.vk.ru/")
-		req.Header.Set("Sec-Fetch-Site", "same-site")
+		req.Header.Set("Origin", "https://api.vk.ru")
+		req.Header.Set("Referer", fmt.Sprintf("https://api.vk.ru/not_robot_captcha?domain=vk.com&session_token=%s&variant=popup&blank=1", sessionToken))
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
 		req.Header.Set("Sec-Fetch-Mode", "cors")
 		req.Header.Set("Sec-Fetch-Dest", "empty")
-		req.Header.Set("Sec-GPC", "1")
-		req.Header.Set("Priority", "u=1, i")
 
 		httpResp, err := client.Do(req)
 		if err != nil {
@@ -517,7 +574,13 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 		return resp, nil
 	}
 
-	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=&access_token=", neturl.QueryEscape(sessionToken))
+	adFpBytes := make([]byte, 16)
+	for i := range adFpBytes {
+		adFpBytes[i] = byte(rand.Intn(256))
+	}
+	adFp := base64.RawURLEncoding.EncodeToString(adFpBytes)[:21]
+
+	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=%s&access_token=", neturl.QueryEscape(sessionToken), neturl.QueryEscape(adFp))
 
 	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	if _, err := vkReq("captchaNotRobot.settings", baseParams); err != nil {
@@ -529,6 +592,10 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	log.Printf("[STREAM %d] [Captcha] Step 2/4: componentDone", streamID)
 	browserFp := generateBrowserFp(profile)
 	deviceJSON := buildCaptchaDeviceJSON(profile)
+	if savedProfile != nil {
+		browserFp = savedProfile.BrowserFp
+		deviceJSON = savedProfile.DeviceJSON
+	}
 	componentDoneData := baseParams + fmt.Sprintf("&browser_fp=%s&device=%s", browserFp, neturl.QueryEscape(deviceJSON))
 
 	if _, err := vkReq("captchaNotRobot.componentDone", componentDoneData); err != nil {
@@ -538,15 +605,16 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
-	cursorJSON := generateFakeCursor()
+	// The real browser sends an empty array for cursor on the first check.
+	cursorJSON := "[]"
 	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
 
-	// Dynamically generate debug_info to avoid static fingerprint bans
-	debugInfoBytes := md5.Sum([]byte(profile.UserAgent + strconv.FormatInt(time.Now().UnixNano(), 10)))
-	debugInfo := hex.EncodeToString(debugInfoBytes[:])
+	// The real browser sends a static SHA-256 hash for debug_info.
+	// We use the exact one captured from the real browser's session.
+	debugInfo := "f3ef768dab7a20f574c6461f34e4257894d2a3c30a53d8727a3edaf7ab70847d"
 
-	connectionRtt := "[50,50,50,50,50,50,50,50,50,50]"
-	connectionDownlink := "[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"
+	connectionRtt := "[250,250,250,250,250]"
+	connectionDownlink := "[1.45,1.45,1.45,1.45,1.45]"
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -956,7 +1024,9 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					}
 				case captchaSolveModeManual:
 					log.Printf("[STREAM %d] [Captcha] Triggering manual captcha fallback...", streamID)
-					manualCtx, manualCancel := context.WithTimeout(ctx, 60*time.Second)
+					// Use context.Background() so that a short deadline on the parent ctx
+					// (e.g. the overall auth timeout) doesn't cut the user's solve time short.
+					manualCtx, manualCancel := context.WithTimeout(context.Background(), 3*time.Minute)
 
 					type manualRes struct {
 						token string
@@ -983,8 +1053,24 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 						successToken = res.token
 						captchaKey = res.key
 						solveErr = res.err
+						// Token may be present even when err != nil (e.g. srv.Shutdown
+						// timed out on iSH after the token was already received).
+						// Treat a non-empty token as success regardless of the error.
+						if successToken != "" || captchaKey != "" {
+							if solveErr != nil {
+								log.Printf("[STREAM %d] [Captcha] Token received (ignoring cleanup error: %v)", streamID, solveErr)
+								solveErr = nil
+							}
+							log.Printf("[STREAM %d] [Captcha] Successfully got token from browser", streamID)
+						} else if solveErr != nil {
+							log.Printf("[STREAM %d] [Captcha] solveCaptchaViaProxy returned error: %v", streamID, solveErr)
+						}
 					case <-manualCtx.Done():
-						solveErr = fmt.Errorf("manual captcha timed out after 60s")
+						if manualCtx.Err() == context.DeadlineExceeded {
+							solveErr = fmt.Errorf("manual captcha timed out after 3m")
+						} else {
+							solveErr = fmt.Errorf("manual captcha interrupted: %w", manualCtx.Err())
+						}
 					}
 					manualCancel()
 				}
@@ -1783,7 +1869,31 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 	}
 }
 
+func setupGlobalResolver() {
+	dialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+	dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var lastErr error
+			for _, dns := range dnsServers {
+				conn, err := dialer.DialContext(ctx, "udp", dns)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		},
+	}
+}
+
 func main() {
+	setupGlobalResolver()
 	ctx, cancel := context.WithCancel(context.Background())
 	globalAppCancel = cancel
 	defer cancel()
@@ -2047,12 +2157,19 @@ func runVLESSMode(ctx context.Context, tp *turnParams, peer *net.UDPAddr, listen
 	if err != nil {
 		log.Panicf("TCP listen: %s", err)
 	}
-	context.AfterFunc(ctx, func() { _ = listener.Close() })
+
+	wrappedListener, err := wrapISHListener(listener)
+	if err != nil {
+		log.Printf("Warning: failed to wrap listener: %v", err)
+		wrappedListener = listener
+	}
+
+	context.AfterFunc(ctx, func() { _ = wrappedListener.Close() })
 	log.Printf("VLESS mode: listening on %s (round-robin across %d sessions)", listenAddr, numSessions)
 
 	var wgConn sync.WaitGroup
 	for {
-		tcpConn, err := listener.Accept()
+		tcpConn, err := wrappedListener.Accept()
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -2308,21 +2425,29 @@ func pipe(ctx context.Context, c1, c2 net.Conn) {
 		defer wg.Done()
 		defer cancel()
 		if _, err := io.Copy(c1, c2); err != nil {
-			log.Printf("pipe: c1<-c2 copy error: %v", err)
+			if isDebug {
+				log.Printf("pipe: c1<-c2 copy error: %v", err)
+			}
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		defer cancel()
 		if _, err := io.Copy(c2, c1); err != nil {
-			log.Printf("pipe: c2<-c1 copy error: %v", err)
+			if isDebug {
+				log.Printf("pipe: c2<-c1 copy error: %v", err)
+			}
 		}
 	}()
 	wg.Wait()
 	if err := c1.SetDeadline(time.Time{}); err != nil {
-		log.Printf("pipe: failed to reset deadline c1: %v", err)
+		if isDebug {
+			log.Printf("pipe: failed to reset deadline c1: %v", err)
+		}
 	}
 	if err := c2.SetDeadline(time.Time{}); err != nil {
-		log.Printf("pipe: failed to reset deadline c2: %v", err)
+		if isDebug {
+			log.Printf("pipe: failed to reset deadline c2: %v", err)
+		}
 	}
 }
