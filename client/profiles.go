@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"sync"
 )
 
 type Profile struct {
@@ -11,7 +15,68 @@ type Profile struct {
 	SecChUaPlatform string
 }
 
-// profiles contain paired User-Agent and Client Hints strings to harden bot detection.
+// SavedProfile is the captured browser fingerprint persisted after a manual
+// captcha session. Reused for subsequent auto-solve attempts so VK sees a
+// consistent (browser_fp, device, UA) triple rather than a freshly-generated one.
+type SavedProfile struct {
+	Profile
+	DeviceJSON string
+	BrowserFp  string
+}
+
+const profileFileName = "vk_profile.json"
+
+var (
+	profilePathOnce sync.Once
+	profilePathVal  string
+)
+
+// profileFilePath returns a writeable absolute path for the cached browser
+// profile. Order: $VK_PROFILE_PATH, os.UserCacheDir(), os.TempDir(), CWD.
+// CWD is last because on Android it's the read-only APK lib dir.
+func profileFilePath() string {
+	profilePathOnce.Do(func() {
+		if p := os.Getenv("VK_PROFILE_PATH"); p != "" {
+			profilePathVal = p
+			return
+		}
+		if dir, err := os.UserCacheDir(); err == nil {
+			sub := filepath.Join(dir, "vk-turn-proxy")
+			if mkErr := os.MkdirAll(sub, 0o755); mkErr == nil {
+				profilePathVal = filepath.Join(sub, profileFileName)
+				return
+			}
+		}
+		if tmp := os.TempDir(); tmp != "" {
+			profilePathVal = filepath.Join(tmp, profileFileName)
+			return
+		}
+		profilePathVal = profileFileName
+	})
+	return profilePathVal
+}
+
+func LoadProfileFromDisk() (*SavedProfile, error) {
+	data, err := os.ReadFile(profileFilePath())
+	if err != nil {
+		return nil, err
+	}
+	var sp SavedProfile
+	if err := json.Unmarshal(data, &sp); err != nil {
+		return nil, err
+	}
+	return &sp, nil
+}
+
+func SaveProfileToDisk(sp SavedProfile) error {
+	data, err := json.MarshalIndent(sp, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(profileFilePath(), data, 0o644)
+}
+
+// profile contains paired User-Agent and Client Hints strings to harden bot detection.
 var profile = []Profile{
 	// Windows Chrome
 	{
