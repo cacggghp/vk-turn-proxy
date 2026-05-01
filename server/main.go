@@ -169,6 +169,33 @@ func handleUDPConnection(ctx context.Context, conn net.Conn, connectAddr string)
 				return
 			}
 
+			// Liveness-probe echo. Clients may send short sentinel
+			// packets (4-byte magic 0xff 'P' 'N' 'G' + payload)
+			// periodically over a DTLS conn to detect data-path
+			// failures that don't show up at the control plane —
+			// e.g. TURN allocations where Refresh/keepalive succeed
+			// but the relay's NAT mapping is stale and packets are
+			// silently dropped. We echo the bytes back through the
+			// same DTLS conn — pion's dtls.Conn is goroutine-safe so
+			// concurrent Write from this read-loop and the WG-receive
+			// loop below is fine. The first byte 0xff falls outside
+			// WireGuard's 1..4 message types, so without this branch
+			// the bytes would be forwarded to serverConn (WG) and
+			// silently dropped — which is also what unpatched servers
+			// do, hence clients sending probes to an unpatched server
+			// see no echo and degrade gracefully.
+			if n >= 4 && buf[0] == 0xff && buf[1] == 'P' && buf[2] == 'N' && buf[3] == 'G' {
+				if err1 := conn.SetWriteDeadline(time.Now().Add(5 * time.Second)); err1 != nil {
+					log.Printf("Failed to set probe-echo deadline: %s", err1)
+					return
+				}
+				if _, err1 := conn.Write(buf[:n]); err1 != nil {
+					log.Printf("Failed to echo probe: %s", err1)
+					return
+				}
+				continue
+			}
+
 			if err1 = serverConn.SetWriteDeadline(time.Now().Add(time.Minute * 30)); err1 != nil {
 				log.Printf("Failed: %s", err1)
 				return
