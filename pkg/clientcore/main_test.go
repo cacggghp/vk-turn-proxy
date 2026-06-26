@@ -1,4 +1,4 @@
-package main
+package clientcore
 
 import "testing"
 
@@ -58,4 +58,51 @@ func TestCaptchaSolveModeForAttempt(t *testing.T) {
 			t.Fatal("expected only two attempts when slider POC is disabled")
 		}
 	})
+}
+
+func TestParseVkCaptchaErrorSupportsSmartCaptchaRedirectOnly(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":         float64(14),
+		"error_msg":          "Captcha need",
+		"is_enabled_captcha": true,
+		"redirect_uri":       "https://id.vk.ru/not_robot_captcha?domain=vk.com&session_token=session-123&variant=popup&blank=1",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected captcha error to parse")
+		return
+	}
+	if !captchaErr.IsCaptchaError() {
+		t.Fatal("expected parsed error to be recognized as captcha")
+	}
+	if captchaErr.SessionToken != "session-123" {
+		t.Fatalf("expected session token from redirect_uri, got %q", captchaErr.SessionToken)
+	}
+	if captchaErr.CaptchaSid != "" {
+		t.Fatalf("expected missing captcha_sid to stay empty, got %q", captchaErr.CaptchaSid)
+	}
+}
+
+func TestParseVkCaptchaErrorSupportsLegacyImageCaptcha(t *testing.T) {
+	t.Parallel()
+
+	captchaErr := ParseVkCaptchaError(map[string]interface{}{
+		"error_code":  float64(14),
+		"error_msg":   "Captcha need",
+		"captcha_sid": float64(12345),
+		"captcha_img": "https://api.vk.ru/captcha.php?sid=12345",
+	})
+
+	if captchaErr == nil {
+		t.Fatal("expected legacy captcha error to parse")
+		return
+	}
+	if !captchaErr.IsCaptchaError() {
+		t.Fatal("expected legacy captcha error to be recognized as captcha")
+	}
+	if captchaErr.CaptchaSid != "12345" {
+		t.Fatalf("expected numeric captcha_sid to parse, got %q", captchaErr.CaptchaSid)
+	}
 }

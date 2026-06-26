@@ -13,8 +13,9 @@ WORKDIR /app
 
 COPY docker-entrypoint.sh .
 COPY --from=builder /build/vk-turn-proxy .
-RUN chmod +x docker-entrypoint.sh
+RUN sed -i 's/\r$//' docker-entrypoint.sh && chmod +x docker-entrypoint.sh
 
+EXPOSE 56000/tcp
 EXPOSE 56000/udp
 
 ENTRYPOINT ["./docker-entrypoint.sh"]

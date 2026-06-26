@@ -49,13 +49,13 @@ linters:
       - third_party$
       - builtin$
       - examples$
+    rules:
+      - linters:
+          - errcheck
+        source: "doRequest|packetPool\\.Get"
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    - linters:
-        - errcheck
-      source: "doRequest|packetPool\\.Get"
 formatters:
   exclusions:
     generated: lax
