@@ -1,0 +1,17 @@
+[Unit]
+Description=vk-turn-proxy captcha solver (Playwright + headless Chromium)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /root/captcha_solver.py --listen 127.0.0.1:8766
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+TasksMax=256
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
