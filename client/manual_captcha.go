@@ -615,3 +615,75 @@ func browserOpenCommands(goos string, url string) []browserCommand {
 	}
 	return nil
 }
+
+// solveCaptchaViaPlaywright delegates the captcha solving to an external
+// HTTP service (typically the captcha_solver.py Python script shipped in
+// /home/z/my-project/scripts/) that drives a real headless Chromium via
+// Playwright. The Chromium instance produces a real FingerprintJS visitor_id
+// and real behavioral telemetry, which is the only reliable way to pass
+// VK's not_robot_captcha bot detection.
+//
+// API contract:
+//
+//	POST <solverURL>/solve
+//	Body: {"redirect_uri": "https://id.vk.ru/not_robot_captcha?..."}
+//	Response: {"success_token": "...", "elapsed": 8.3}
+//	         or {"error": "...", "elapsed": 8.3}
+//
+// The solver must already be running (e.g. `python3 captcha_solver.py`).
+// Configure via `-captcha-solver http://127.0.0.1:8766` CLI flag.
+func solveCaptchaViaPlaywright(redirectURI string, streamID int) (string, error) {
+	if captchaSolverURL == "" {
+		return "", fmt.Errorf("no captcha solver URL configured")
+	}
+
+	payload := map[string]string{"redirect_uri": redirectURI}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", fmt.Errorf("marshal solver request: %w", err)
+	}
+
+	solveURL := strings.TrimRight(captchaSolverURL, "/") + "/solve"
+	log.Printf("[STREAM %d] [Captcha] Calling Playwright solver at %s", streamID, solveURL)
+
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+	req, err := http.NewRequest("POST", solveURL, bytes.NewReader(body))
+	if err != nil {
+		return "", fmt.Errorf("build solver request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("solver HTTP call failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read solver response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("solver returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		SuccessToken string  `json:"success_token"`
+		Elapsed      float64 `json:"elapsed"`
+		Error        string  `json:"error"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("parse solver response: %w (body: %s)", err, string(respBody))
+	}
+
+	if result.Error != "" {
+		return "", fmt.Errorf("solver error: %s", result.Error)
+	}
+	if result.SuccessToken == "" {
+		return "", fmt.Errorf("solver returned empty success_token")
+	}
+
+	log.Printf("[STREAM %d] [Captcha] Playwright solver returned success_token (elapsed=%.1fs)", streamID, result.Elapsed)
+	return result.SuccessToken, nil
+}
