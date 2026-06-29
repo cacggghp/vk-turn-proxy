@@ -10,6 +10,7 @@
 > Авторы данного репозитория не несут ответственности за другие похожие проекты.
 
 #### Server
+- https://github.com/TheAirBlow/Turnable - актуальная реализация с модульной архитектурой
 - https://github.com/Urtyom-Alyanov/turn-proxy - реализация на Rust
 - https://github.com/jaykaiperson/lionheart - аналог для https://stream.wb.ru (статья: https://habr.com/ru/articles/1017410/)
 - https://github.com/kulikov0/whitelist-bypass - проброс через медиасервер SFU ВК и Яндекс Телемоста
