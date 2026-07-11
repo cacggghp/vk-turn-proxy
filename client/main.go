@@ -345,6 +345,56 @@ func getCustomNetDialer() net.Dialer {
 	}
 }
 
+// customResolver is a net.Resolver that uses public DNS servers as fallback.
+// On Android (CGO_ENABLED=0) the system resolver may not work, so we provide
+// a Go-native resolver that queries multiple public DNS servers directly.
+var customResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+		var lastErr error
+		for _, dns := range dnsServers {
+			conn, err := d.DialContext(ctx, "udp", dns)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	},
+}
+
+// resolveUDPAddr resolves a host:port string to *net.UDPAddr.
+// Works with both IP addresses and domain names.
+// Uses the custom DNS resolver (public DNS fallback) so domain resolution
+// works on Android where the system resolver may be unavailable.
+func resolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port %q: %w", address, err)
+	}
+
+	// If host is already an IP address, skip DNS resolution
+	if ip := net.ParseIP(host); ip != nil {
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	// Resolve domain name using custom resolver (public DNS fallback)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ips, err := customResolver.LookupIP(ctx, "ip4", host)
+	if err != nil || len(ips) == 0 {
+		// Fallback: try system resolver
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	resolved := net.JoinHostPort(ips[0].String(), port)
+	log.Printf("[DNS] resolved %s → %s", host, ips[0].String())
+	return net.ResolveUDPAddr(network, resolved)
+}
+
 // endregion
 
 // region Automatic Captcha Solver & Authentication
@@ -1715,6 +1765,7 @@ type turnParams struct {
 	link     string
 	udp      bool
 	getCreds getCredsFunc
+	wrapKey  []byte
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
@@ -1739,7 +1790,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 	var turnServerAddr string
 	turnServerAddr = net.JoinHostPort(urlhost, urlport)
-	turnServerUDPAddr, err1 := net.ResolveUDPAddr("udp", turnServerAddr)
+	turnServerUDPAddr, err1 := resolveUDPAddr("udp", turnServerAddr)
 	if err1 != nil {
 		err = fmt.Errorf("failed to resolve TURN server address: %s", err1)
 		return
@@ -1845,9 +1896,24 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	})
 	var internalPipeAddr atomic.Value
 
+	var wc *wrapConn
+	if len(turnParams.wrapKey) == wrapKeyLen {
+		var wcErr error
+		wc, wcErr = newWrapConn(turnParams.wrapKey, false)
+		if wcErr != nil {
+			log.Printf("[STREAM %d] WRAP init failed: %v", streamID, wcErr)
+			turncancel()
+			return
+		}
+	}
+
 	go func() {
 		defer turncancel()
 		buf := make([]byte, 1600)
+		var wireBuf []byte
+		if wc != nil {
+			wireBuf = make([]byte, wrapMaxWire(len(buf)))
+		}
 		for {
 			if turnctx.Err() != nil {
 				return
@@ -1862,7 +1928,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			internalPipeAddr.Store(addr1)
 
-			_, err1 = relayConn.WriteTo(buf[:n], peer)
+			out := buf[:n]
+			if wc != nil {
+				written, wrapErr := wc.wrapInto(wireBuf, out)
+				if wrapErr != nil {
+					log.Printf("[STREAM %d] WRAP failed: %v", streamID, wrapErr)
+					return
+				}
+				out = wireBuf[:written]
+			}
+
+			_, err1 = relayConn.WriteTo(out, peer)
 			if err1 != nil {
 				return
 			}
@@ -1872,7 +1948,12 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		readBufLen := 1600
+		if wc != nil {
+			readBufLen = wrapMaxWire(1600)
+		}
+		buf := make([]byte, readBufLen)
+		plain := make([]byte, 1600)
 		for {
 			n, _, err1 := relayConn.ReadFrom(buf)
 			if err1 != nil {
@@ -1884,7 +1965,16 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			}
 
 			if addr, ok := addr1.(net.Addr); ok {
-				if _, err := conn2.WriteTo(buf[:n], addr); err != nil {
+				payload := buf[:n]
+				if wc != nil {
+					m, wrapErr := wc.unwrapPacket(payload, plain)
+					if wrapErr != nil {
+						log.Printf("[STREAM %d] UNWRAP failed: %v (n=%d)", streamID, wrapErr, n)
+						continue
+					}
+					payload = plain[:m]
+				}
+				if _, err := conn2.WriteTo(payload, addr); err != nil {
 					return
 				}
 			}
@@ -2006,11 +2096,23 @@ func main() {
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
 	captchaSolverFlag := flag.String("captcha-solver", "", "URL of Playwright-based captcha solver (e.g. http://127.0.0.1:8766). When set, captcha is solved via real headless Chromium, bypassing VK's bot detection. Requires captcha_solver.py running on the host.")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-mimicry AEAD wrap DTLS packets. Peer server must use matching -wrap-key.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
 	flag.Parse()
+
+	if *genWrapKey {
+		key, err := genWrapKeyHex()
+		if err != nil {
+			log.Panicf("gen-wrap-key: %v", err)
+		}
+		fmt.Println(key)
+		return
+	}
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
-	peer, err := net.ResolveUDPAddr("udp", *peerAddr)
+	peer, err := resolveUDPAddr("udp", *peerAddr)
 	if err != nil {
 		panic(err)
 	}
@@ -2024,6 +2126,17 @@ func main() {
 	captchaSolverURL = *captchaSolverFlag
 	if captchaSolverURL != "" {
 		log.Printf("[Captcha] Playwright solver enabled: %s (will be tried first, then fallback to auto/manual)", captchaSolverURL)
+	}
+
+	if *wrapMode && *direct {
+		log.Panicf("-wrap requires DTLS; remove -no-dtls")
+	}
+	wrapKey, err := decodeWrapKey(*wrapMode, *wrapKeyHex)
+	if err != nil {
+		log.Panicf("%v", err)
+	}
+	if *wrapMode {
+		log.Printf("WRAP mode enabled: SRTP-mimicry AEAD. Peer server must use matching -wrap-key.")
 	}
 
 	var link string
@@ -2064,6 +2177,7 @@ func main() {
 		link:     link,
 		udp:      *udp,
 		getCreds: getCreds,
+		wrapKey:  wrapKey,
 	}
 
 	if *vlessMode {
@@ -2356,7 +2470,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		urlport = tp.port
 	}
 	turnServerAddr := net.JoinHostPort(urlhost, urlport)
-	turnServerUDPAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
+	turnServerUDPAddr, err := resolveUDPAddr("udp", turnServerAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve TURN addr: %w", err)
 	}
@@ -2425,7 +2539,15 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("generate cert: %w", err)
 	}
-	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
+	var relayWC *wrapConn
+	if len(tp.wrapKey) == wrapKeyLen {
+		relayWC, err = newWrapConn(tp.wrapKey, false)
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("wrap init: %w", err)
+		}
+	}
+	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer, wc: relayWC}
 	dtlsConn, err := dtls.ClientWithOptions(dtlsPC, peer,
 		dtls.WithCertificates(certificate),
 		dtls.WithInsecureSkipVerify(true),
@@ -2472,14 +2594,38 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 type relayPacketConn struct {
 	relay net.PacketConn
 	peer  net.Addr
+	wc    *wrapConn
 }
 
 func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	return r.relay.ReadFrom(b)
+	if r.wc == nil {
+		return r.relay.ReadFrom(b)
+	}
+	buf := make([]byte, wrapMaxWire(len(b)))
+	n, addr, err := r.relay.ReadFrom(buf)
+	if err != nil {
+		return 0, addr, err
+	}
+	m, err := r.wc.unwrapPacket(buf[:n], b)
+	if err != nil {
+		return 0, addr, err
+	}
+	return m, addr, nil
 }
 
 func (r *relayPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	return r.relay.WriteTo(b, r.peer)
+	if r.wc == nil {
+		return r.relay.WriteTo(b, r.peer)
+	}
+	out := make([]byte, wrapMaxWire(len(b)))
+	n, err := r.wc.wrapInto(out, b)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = r.relay.WriteTo(out[:n], r.peer); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (r *relayPacketConn) Close() error                       { return r.relay.Close() }

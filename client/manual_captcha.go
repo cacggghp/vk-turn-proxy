@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -343,6 +344,12 @@ func newCaptchaProxyTransport(dialer *dnsdialer.Dialer) *http.Transport {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ForceAttemptHTTP2:     false,
+		// Use the same CA bundle as the main tls-client (system pool →
+		// embedded Mozilla bundle). Without this, the captcha proxy fails
+		// on Android with "x509: certificate signed by unknown authority"
+		// because HARICA TLS RSA Root CA 2021 is not in the empty Android
+		// system cert pool.
+		TLSClientConfig: &tls.Config{RootCAs: loadCABundle()},
 	}
 	if dialer != nil {
 		transport.DialContext = dialer.DialContext
