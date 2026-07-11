@@ -23,7 +23,6 @@ import (
 )
 
 const (
-	captchaDebugInfo      = "1d3e9babfd3a74f4588bf90cf5c30d3e8e89a0e2a4544da8de8bbf4d78a32f5c"
 	sliderCaptchaType     = "slider"
 	defaultSliderAttempts = 4
 )
@@ -132,6 +131,23 @@ func (s *captchaNotRobotSession) requestSettings() (*captchaSettingsResponse, er
 	return parseCaptchaSettingsResponse(resp)
 }
 
+// requestInitSession mirrors VK's not_robot_captcha.js which calls
+// captchaNotRobot.initSession before settings. The response carries captcha_id
+// and content_settings (encrypted per-type config). Calling it sets up
+// server-side session state that the subsequent check expects.
+func (s *captchaNotRobotSession) requestInitSession() {
+	resp, err := s.request("captchaNotRobot.initSession", s.baseValues())
+	if err != nil {
+		log.Printf("[STREAM %d] [Captcha] Warning: initSession failed: %v (continuing)", s.streamID, err)
+		return
+	}
+	if respObj, ok := resp["response"].(map[string]interface{}); ok {
+		if showType, _ := respObj["show_captcha_type"].(string); showType != "" {
+			log.Printf("[STREAM %d] [Captcha] initSession: show_captcha_type=%s", s.streamID, showType)
+		}
+	}
+}
+
 func (s *captchaNotRobotSession) requestComponentDone() error {
 	values := s.baseValues()
 	values.Set("browser_fp", s.browserFp)
@@ -185,17 +201,31 @@ func (s *captchaNotRobotSession) requestCheck(cursor string, answer string) (*ca
 	values.Set("motion", "[]")
 	values.Set("cursor", cursor)
 	values.Set("taps", "[]")
-	values.Set("connectionRtt", "[]")
-	values.Set("connectionDownlink", "[]")
+	// Realistic connection telemetry with jitter (constant arrays are a bot fingerprint).
+	values.Set("connectionRtt", generateConnectionRtt(10))
+	values.Set("connectionDownlink", generateConnectionDownlink(16))
 	values.Set("browser_fp", s.browserFp)
 	values.Set("hash", s.hash)
 	values.Set("answer", answer)
-	values.Set("debug_info", captchaDebugInfo)
+	// VK's not_robot_captcha.js sends either window.vk.brlefapmjnpg or the
+	// hardcoded fallback. The previous captchaDebugInfo constant here was a
+	// different hardcoded MD5, which VK treats as a strong bot signal.
+	values.Set("debug_info", captchaDebugInfoHardcoded)
 
 	resp, err := s.request("captchaNotRobot.check", values)
 	if err != nil {
 		return nil, fmt.Errorf("check failed: %w", err)
 	}
+
+	// Log the raw check response so future debugging is easier.
+	if respObj, ok := resp["response"].(map[string]interface{}); ok {
+		status, _ := respObj["status"].(string)
+		showType, _ := respObj["show_captcha_type"].(string)
+		redirect, _ := respObj["redirect"].(string)
+		log.Printf("[STREAM %d] [Captcha] check response: status=%s show_captcha_type=%q redirect=%q",
+			s.streamID, status, showType, redirect)
+	}
+
 	return parseCaptchaCheckResult(resp)
 }
 
@@ -216,6 +246,10 @@ func callCaptchaNotRobotWithSliderPOC(
 	initialSettings *captchaSettingsResponse,
 ) (string, error) {
 	session := newCaptchaNotRobotSession(ctx, sessionToken, hash, streamID, client, profile)
+
+	log.Printf("[STREAM %d] [Captcha] Step 0/4: initSession", streamID)
+	session.requestInitSession()
+	time.Sleep(200 * time.Millisecond)
 
 	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	settingsResp, err := session.requestSettings()

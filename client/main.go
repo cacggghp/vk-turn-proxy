@@ -21,6 +21,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,6 +68,7 @@ var (
 	isDebug              bool
 	manualCaptcha        bool
 	autoCaptchaSliderPOC bool
+	captchaSolverURL     string // e.g. "http://127.0.0.1:8766" — Playwright-based solver
 )
 
 type captchaSolveMode int
@@ -75,9 +77,33 @@ const (
 	captchaSolveModeAuto captchaSolveMode = iota
 	captchaSolveModeSliderPOC
 	captchaSolveModeManual
+	captchaSolveModePlaywright
 )
 
 func captchaSolveModeForAttempt(attempt int, manualOnly bool, enableSliderPOC bool) (captchaSolveMode, bool) {
+	// If a Playwright solver URL is configured, try it FIRST — it's the only
+	// mode that reliably passes VK's bot detection (because the check request
+	// comes from a real Chromium with a real FingerprintJS visitor_id).
+	// Fall back to the legacy modes if the solver is unreachable / fails.
+	if captchaSolverURL != "" && !manualOnly {
+		switch attempt {
+		case 0:
+			return captchaSolveModePlaywright, true
+		case 1:
+			return captchaSolveModeAuto, true
+		case 2:
+			if enableSliderPOC {
+				return captchaSolveModeSliderPOC, true
+			}
+			return captchaSolveModeManual, true
+		case 3:
+			if enableSliderPOC {
+				return captchaSolveModeManual, true
+			}
+		}
+		return 0, false
+	}
+
 	if manualOnly {
 		return captchaSolveModeManual, attempt == 0
 	}
@@ -107,6 +133,8 @@ func captchaSolveModeLabel(mode captchaSolveMode) string {
 		return "auto captcha slider POC"
 	case captchaSolveModeManual:
 		return "manual captcha"
+	case captchaSolveModePlaywright:
+		return "playwright solver"
 	default:
 		return "captcha"
 	}
@@ -247,6 +275,53 @@ func generateFakeCursor() string {
 	return "[" + strings.Join(points, ",") + "]"
 }
 
+// generateConnectionRtt produces a realistic Navigator.connection.rtt sample
+// array. Real browsers observe slight per-sample variation around a baseline
+// (e.g. 50ms +/- 5-15ms jitter, occasional spikes). Sending the constant
+// [50,50,50,...] is a known bot fingerprint.
+func generateConnectionRtt(n int) string {
+	if n <= 0 {
+		n = 10
+	}
+	base := 45 + rand.Intn(40) // 45..84 ms baseline
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		// jitter: -10..+30 ms, with occasional spike (+30..+90)
+		jitter := rand.Intn(41) - 10
+		if rand.Intn(8) == 0 { // ~12% chance of a spike
+			jitter += 30 + rand.Intn(60)
+		}
+		val := base + jitter
+		if val < 5 {
+			val = 5
+		}
+		parts = append(parts, strconv.Itoa(val))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// generateConnectionDownlink produces a realistic Navigator.connection.downlink
+// sample array. Real values are MBps floats with mild variation (e.g. 9.5, 9.6,
+// 9.4, 10.1, ...). Constant [9.5,9.5,...] is a known bot fingerprint.
+func generateConnectionDownlink(n int) string {
+	if n <= 0 {
+		n = 16
+	}
+	// baseline 5.0..15.0 Mbps, one decimal place
+	baseTenths := 50 + rand.Intn(100) // 5.0..14.9
+	parts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		// jitter -3..+3 tenths
+		jitter := rand.Intn(7) - 3
+		t := baseTenths + jitter
+		if t < 10 {
+			t = 10 // floor at 1.0 Mbps
+		}
+		parts = append(parts, fmt.Sprintf("%.1f", float64(t)/10.0))
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
 func getCustomNetDialer() net.Dialer {
 	return net.Dialer{
 		Timeout:   20 * time.Second,
@@ -270,6 +345,56 @@ func getCustomNetDialer() net.Dialer {
 	}
 }
 
+// customResolver is a net.Resolver that uses public DNS servers as fallback.
+// On Android (CGO_ENABLED=0) the system resolver may not work, so we provide
+// a Go-native resolver that queries multiple public DNS servers directly.
+var customResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+		var lastErr error
+		for _, dns := range dnsServers {
+			conn, err := d.DialContext(ctx, "udp", dns)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	},
+}
+
+// resolveUDPAddr resolves a host:port string to *net.UDPAddr.
+// Works with both IP addresses and domain names.
+// Uses the custom DNS resolver (public DNS fallback) so domain resolution
+// works on Android where the system resolver may be unavailable.
+func resolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port %q: %w", address, err)
+	}
+
+	// If host is already an IP address, skip DNS resolution
+	if ip := net.ParseIP(host); ip != nil {
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	// Resolve domain name using custom resolver (public DNS fallback)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ips, err := customResolver.LookupIP(ctx, "ip4", host)
+	if err != nil || len(ips) == 0 {
+		// Fallback: try system resolver
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	resolved := net.JoinHostPort(ips[0].String(), port)
+	log.Printf("[DNS] resolved %s → %s", host, ips[0].String())
+	return net.ResolveUDPAddr(network, resolved)
+}
+
 // endregion
 
 // region Automatic Captcha Solver & Authentication
@@ -287,7 +412,7 @@ type VkCaptchaError struct {
 }
 
 func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
-	// Extract error_code
+	// Extract error_code (required — identifies this as a VK API error object)
 	codeFloat, ok := errData["error_code"].(float64)
 	if !ok {
 		log.Printf("missing error_code in captcha error data")
@@ -295,48 +420,45 @@ func ParseVkCaptchaError(errData map[string]interface{}) *VkCaptchaError {
 	}
 	code := int(codeFloat)
 
-	// Extract redirect_uri
-	RedirectURI, ok := errData["redirect_uri"].(string)
-	if !ok {
-		log.Printf("missing redirect_uri in captcha error data")
-		return nil
-	}
+	// Extract redirect_uri (optional). Present in the NEW VK captcha flow where
+	// the user/automaton is redirected to https://id.vk.ru/not_robot_captcha?...
+	// Absent in the legacy captcha flow (which uses captcha_sid + captcha_img).
+	RedirectURI, _ := errData["redirect_uri"].(string)
 
-	// Extract captcha_sid
+	// Extract captcha_sid (optional in the new flow, required in the legacy flow).
 	captchaSid, ok := errData["captcha_sid"].(string)
 	if !ok {
 		// try numeric
 		if sidNum, ok2 := errData["captcha_sid"].(float64); ok2 {
 			captchaSid = fmt.Sprintf("%.0f", sidNum)
-		} else {
-			log.Printf("missing captcha_sid in captcha error data")
-			return nil
 		}
 	}
 
-	// Extract captcha_img
-	captchaImg, ok := errData["captcha_img"].(string)
-	if !ok {
-		log.Printf("missing captcha_img in captcha error data")
-		return nil
-	}
+	// Extract captcha_img (optional in the new flow, required in the legacy flow).
+	captchaImg, _ := errData["captcha_img"].(string)
 
-	// Extract error_msg
-	errorMsg, ok := errData["error_msg"].(string)
-	if !ok {
-		log.Printf("missing error_msg in captcha error data")
-		return nil
-	}
+	// Extract error_msg (optional — only used for logging/diagnostics).
+	errorMsg, _ := errData["error_msg"].(string)
 
 	// Extract session token if redirect_uri present
 	var sessionToken string
 	if RedirectURI != "" {
-		if parsed, err := neturl.Parse(RedirectURI); err == nil {
-			sessionToken = parsed.Query().Get("session_token")
-		} else {
+		parsed, err := neturl.Parse(RedirectURI)
+		if err != nil {
 			log.Printf("failed to parse redirect_uri: %v", err)
 			return nil
 		}
+		sessionToken = parsed.Query().Get("session_token")
+	}
+
+	// Require at least one solvable captcha path before returning a result:
+	//   - new flow:  redirect_uri + session_token (solved via not_robot_captcha)
+	//   - legacy flow: captcha_img (manual HTTP) typically paired with captcha_sid
+	// Without any of these, there is nothing the caller can do, so return nil
+	// and let the auth loop surface the raw VK API error.
+	if RedirectURI == "" && sessionToken == "" && captchaImg == "" && captchaSid == "" {
+		log.Printf("no solvable captcha path in error data: %v", errData)
+		return nil
 	}
 
 	// Extract is_sound_captcha_available
@@ -400,22 +522,26 @@ func solveVkCaptcha(ctx context.Context, captchaErr *VkCaptchaError, streamID in
 
 	log.Printf("[STREAM %d] [Captcha] PoW input: %s, difficulty: %d", streamID, bootstrap.PowInput, bootstrap.Difficulty)
 
-	hash := solvePoW(bootstrap.PowInput, bootstrap.Difficulty)
-	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s", streamID, hash)
+	hexHash, nonce, ok := solvePoW(bootstrap.PowInput, bootstrap.Difficulty)
+	if !ok {
+		return "", fmt.Errorf("PoW solve exhausted nonce budget (input=%s, difficulty=%d)", bootstrap.PowInput, bootstrap.Difficulty)
+	}
+	powResult := formatPoWResult(hexHash, nonce)
+	log.Printf("[STREAM %d] [Captcha] PoW solved: hash=%s nonce=%d (v2-wrapped, len=%d)", streamID, hexHash, nonce, len(powResult))
 
 	var successToken string
 	if useSliderPOC {
 		successToken, err = callCaptchaNotRobotWithSliderPOC(
 			ctx,
 			captchaErr.SessionToken,
-			hash,
+			powResult,
 			streamID,
 			client,
 			profile,
 			bootstrap.Settings,
 		)
 	} else {
-		successToken, err = callCaptchaNotRobot(ctx, captchaErr.SessionToken, hash, streamID, client, profile)
+		successToken, err = callCaptchaNotRobot(ctx, captchaErr.SessionToken, powResult, streamID, client, profile)
 	}
 	if err != nil {
 		return "", fmt.Errorf("captchaNotRobot API failed: %w", err)
@@ -459,17 +585,64 @@ func fetchCaptchaBootstrap(ctx context.Context, redirectURI string, client tlscl
 	return parseCaptchaBootstrapHTML(string(body))
 }
 
-func solvePoW(powInput string, difficulty int) string {
+// solvePoW finds a nonce so that sha256(powInput + str(nonce)) starts with
+// `difficulty` zero characters. Returns (hexHash, nonce, ok).
+//
+// VK's not_robot_captcha.js stores the result as:
+//
+//	window.captchaPowResult = "v2." + btoa(JSON.stringify({ hash, nonce }))
+//
+// so callers must wrap the return value via formatPoWResult() before sending
+// it as the `hash` field of captchaNotRobot.check — sending the bare hex hash
+// is the #1 reason VK's bot detector flags the request as "BOT".
+func solvePoW(powInput string, difficulty int) (string, int, bool) {
 	target := strings.Repeat("0", difficulty)
 	for nonce := 1; nonce <= 10000000; nonce++ {
 		data := powInput + strconv.Itoa(nonce)
 		hash := sha256.Sum256([]byte(data))
 		hexHash := hex.EncodeToString(hash[:])
 		if strings.HasPrefix(hexHash, target) {
-			return hexHash
+			return hexHash, nonce, true
 		}
 	}
-	return ""
+	return "", 0, false
+}
+
+// formatPoWResult wraps (hash, nonce) into the v2.<base64(JSON)> format that
+// VK's not_robot_captcha.js produces. Mirrors:
+//
+//	"v2." + btoa(JSON.stringify({ hash, nonce }))
+//
+// where btoa is RFC 4648 standard base64 (no padding stripping).
+func formatPoWResult(hexHash string, nonce int) string {
+	payload := fmt.Sprintf(`{"hash":%q,"nonce":%d}`, hexHash, nonce)
+	encoded := base64.StdEncoding.EncodeToString([]byte(payload))
+	return "v2." + encoded
+}
+
+// captchaDebugInfoHardcoded is the fallback value VK's not_robot_captcha.js
+// sends when window.vk.brlefapmjnpg is undefined:
+//
+//	debug_info: window.vk?.brlefapmjnpg || "4045edac1cb2c18eff209dc09cd5e2e56475a13ed4615413a87618b3c6813f9a"
+//
+// Sending a random MD5 here (the previous behavior) is one of the strongest
+// bot signals VK checks.
+const captchaDebugInfoHardcoded = "4045edac1cb2c18eff209dc09cd5e2e56475a13ed4615413a87618b3c6813f9a"
+
+// formatCaptchaAnswer mirrors VK's not_robot_captcha.js:
+//
+//	answer: $w(JSON.stringify({ value: t }))
+//
+// where $w(s) = btoa(unescape(encodeURIComponent(s))) — i.e. standard base64
+// of the UTF-8 bytes. For a checkbox-style check, t is the user-event value;
+// passing an empty object matches what the JS sends for a synthetic click.
+func formatCaptchaAnswer(valueJSON string) string {
+	if valueJSON == "" {
+		valueJSON = "{}"
+	}
+	// JSON.stringify({value: t}) — t is already JSON-encoded by caller when needed
+	payload := `{"value":` + valueJSON + `}`
+	return base64.StdEncoding.EncodeToString([]byte(payload))
 }
 
 func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamID int, client tlsclient.HttpClient, profile Profile) (string, error) {
@@ -519,6 +692,21 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 
 	baseParams := fmt.Sprintf("session_token=%s&domain=vk.com&adFp=&access_token=", neturl.QueryEscape(sessionToken))
 
+	// Step 0: initSession — VK's not_robot_captcha.js calls this before
+	// settings. Without it the server-side session state is not fully
+	// initialized, which is one of the signals that flags the request as
+	// "BOT" even when everything else looks legitimate.
+	log.Printf("[STREAM %d] [Captcha] Step 0/4: initSession", streamID)
+	if initResp, err := vkReq("captchaNotRobot.initSession", baseParams); err != nil {
+		log.Printf("[STREAM %d] [Captcha] Warning: initSession failed: %v (continuing)", streamID, err)
+	} else if respObj, ok := initResp["response"].(map[string]interface{}); ok {
+		if showType, _ := respObj["show_captcha_type"].(string); showType != "" {
+			log.Printf("[STREAM %d] [Captcha] initSession: show_captcha_type=%s", streamID, showType)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
 	log.Printf("[STREAM %d] [Captcha] Step 1/4: settings", streamID)
 	if _, err := vkReq("captchaNotRobot.settings", baseParams); err != nil {
 		return "", fmt.Errorf("settings failed: %w", err)
@@ -539,14 +727,19 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 
 	log.Printf("[STREAM %d] [Captcha] Step 3/4: check", streamID)
 	cursorJSON := generateFakeCursor()
-	answer := base64.StdEncoding.EncodeToString([]byte("{}"))
+	// answer = $w(JSON.stringify({value: t})). For checkbox-style checks
+	// t is an empty object, so we wrap {} under "value".
+	answer := formatCaptchaAnswer("{}")
 
-	// Dynamically generate debug_info to avoid static fingerprint bans
-	debugInfoBytes := md5.Sum([]byte(profile.UserAgent + strconv.FormatInt(time.Now().UnixNano(), 10)))
-	debugInfo := hex.EncodeToString(debugInfoBytes[:])
+	// debug_info: VK's not_robot_captcha.js sends either window.vk.brlefapmjnpg
+	// (which we don't have, since we're not running inside the page) or the
+	// hardcoded fallback. Sending a random MD5 here is a strong bot signal.
+	debugInfo := captchaDebugInfoHardcoded
 
-	connectionRtt := "[50,50,50,50,50,50,50,50,50,50]"
-	connectionDownlink := "[9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5,9.5]"
+	// Realistic connection telemetry — slight per-sample jitter so the
+	// array doesn't look like a constant signature.
+	connectionRtt := generateConnectionRtt(10)
+	connectionDownlink := generateConnectionDownlink(16)
 
 	checkData := baseParams + fmt.Sprintf(
 		"&accelerometer=%s&gyroscope=%s&motion=%s&cursor=%s&taps=%s&connectionRtt=%s&connectionDownlink=%s&browser_fp=%s&hash=%s&answer=%s&debug_info=%s",
@@ -559,6 +752,16 @@ func callCaptchaNotRobot(ctx context.Context, sessionToken, hash string, streamI
 	checkResp, err := vkReq("captchaNotRobot.check", checkData)
 	if err != nil {
 		return "", fmt.Errorf("check failed: %w", err)
+	}
+
+	// Log the raw check response so future debugging is easier. VK returns
+	// {status:"OK|BOT", success_token, show_captcha_type, redirect}.
+	if respObj, ok := checkResp["response"].(map[string]interface{}); ok {
+		status, _ := respObj["status"].(string)
+		showType, _ := respObj["show_captcha_type"].(string)
+		redirect, _ := respObj["redirect"].(string)
+		log.Printf("[STREAM %d] [Captcha] check response: status=%s show_captcha_type=%q redirect=%q",
+			streamID, status, showType, redirect)
 	}
 
 	respObj, ok := checkResp["response"].(map[string]interface{})
@@ -816,12 +1019,27 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 		SecChUaPlatform: `"Windows"`,
 	}
 
-	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(),
+	clientOpts := []tlsclient.HttpClientOption{
 		tlsclient.WithTimeoutSeconds(20),
 		tlsclient.WithClientProfile(profiles.Chrome_146),
 		tlsclient.WithCookieJar(jar),
 		tlsclient.WithDialer(getCustomNetDialer()),
-	)
+	}
+	// Provide an explicit RootCAs pool. Without it, tls-client falls back
+	// to x509.SystemCertPool() which is empty on Android apps and causes
+	// every HTTPS request to fail with "x509: certificate signed by
+	// unknown authority". loadCABundle() handles system + embedded
+	// Mozilla fallback transparently.
+	if rootPool := loadCABundle(); rootPool != nil {
+		clientOpts = append(clientOpts, tlsclient.WithTransportOptions(
+			&tlsclient.TransportOptions{RootCAs: rootPool},
+		))
+	}
+	if hasHTTPSInsecureEnv() {
+		log.Printf("[STREAM %d] [VK Auth] WARNING: VKTURN_INSECURE_TLS set — skipping TLS verification (debug only!)", streamID)
+		clientOpts = append(clientOpts, tlsclient.WithInsecureSkipVerify())
+	}
+	client, err := tlsclient.NewHttpClient(tlsclient.NewNoopLogger(), clientOpts...)
 	if err != nil {
 		return "", "", "", fmt.Errorf("failed to initialize tls_client: %w", err)
 	}
@@ -936,6 +1154,16 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 				var solveErr error
 
 				switch solveMode {
+				case captchaSolveModePlaywright:
+					log.Printf("[STREAM %d] [Captcha] Using Playwright solver (real Chromium)...", streamID)
+					if captchaErr.RedirectURI != "" {
+						successToken, solveErr = solveCaptchaViaPlaywright(captchaErr.RedirectURI, streamID)
+						if solveErr != nil {
+							log.Printf("[STREAM %d] [Captcha] Playwright solver failed: %v", streamID, solveErr)
+						}
+					} else {
+						solveErr = fmt.Errorf("no redirect_uri for playwright solver")
+					}
 				case captchaSolveModeAuto:
 					if captchaErr.SessionToken != "" && captchaErr.RedirectURI != "" {
 						successToken, solveErr = solveVkCaptcha(ctx, captchaErr, streamID, client, profile, false)
@@ -1019,8 +1247,16 @@ func getTokenChain(ctx context.Context, link string, streamID int, creds VKCrede
 					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=%s&captcha_sid=%s&access_token=%s",
 						link, escapedName, neturl.QueryEscape(captchaKey), captchaErr.CaptchaSid, token1)
 				} else {
-					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=&captcha_sid=%s&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s&access_token=%s",
-						link, escapedName, captchaErr.CaptchaSid, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, token1)
+					// New VK captcha flow: success_token was obtained from
+					// id.vk.ru/not_robot_captcha. captcha_sid is absent in this
+					// flow's error payload, so only include it when present to
+					// avoid sending an empty legacy field that could confuse VK.
+					sidPart := ""
+					if captchaErr.CaptchaSid != "" {
+						sidPart = "&captcha_sid=" + captchaErr.CaptchaSid
+					}
+					data = fmt.Sprintf("vk_join_link=https://vk.com/call/join/%s&name=%s&captcha_key=&is_sound_captcha=0&success_token=%s&captcha_ts=%s&captcha_attempt=%s%s&access_token=%s",
+						link, escapedName, neturl.QueryEscape(successToken), captchaErr.CaptchaTs, captchaErr.CaptchaAttempt, sidPart, token1)
 				}
 				continue
 			}
@@ -1529,6 +1765,7 @@ type turnParams struct {
 	link     string
 	udp      bool
 	getCreds getCredsFunc
+	wrapKey  []byte
 }
 
 func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UDPAddr, conn2 net.PacketConn, streamID int, c chan<- error) {
@@ -1553,7 +1790,7 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	}
 	var turnServerAddr string
 	turnServerAddr = net.JoinHostPort(urlhost, urlport)
-	turnServerUDPAddr, err1 := net.ResolveUDPAddr("udp", turnServerAddr)
+	turnServerUDPAddr, err1 := resolveUDPAddr("udp", turnServerAddr)
 	if err1 != nil {
 		err = fmt.Errorf("failed to resolve TURN server address: %s", err1)
 		return
@@ -1659,9 +1896,24 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	})
 	var internalPipeAddr atomic.Value
 
+	var wc *wrapConn
+	if len(turnParams.wrapKey) == wrapKeyLen {
+		var wcErr error
+		wc, wcErr = newWrapConn(turnParams.wrapKey, false)
+		if wcErr != nil {
+			log.Printf("[STREAM %d] WRAP init failed: %v", streamID, wcErr)
+			turncancel()
+			return
+		}
+	}
+
 	go func() {
 		defer turncancel()
 		buf := make([]byte, 1600)
+		var wireBuf []byte
+		if wc != nil {
+			wireBuf = make([]byte, wrapMaxWire(len(buf)))
+		}
 		for {
 			if turnctx.Err() != nil {
 				return
@@ -1676,7 +1928,17 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 
 			internalPipeAddr.Store(addr1)
 
-			_, err1 = relayConn.WriteTo(buf[:n], peer)
+			out := buf[:n]
+			if wc != nil {
+				written, wrapErr := wc.wrapInto(wireBuf, out)
+				if wrapErr != nil {
+					log.Printf("[STREAM %d] WRAP failed: %v", streamID, wrapErr)
+					return
+				}
+				out = wireBuf[:written]
+			}
+
+			_, err1 = relayConn.WriteTo(out, peer)
 			if err1 != nil {
 				return
 			}
@@ -1686,7 +1948,12 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 	go func() {
 		defer wg.Done()
 		defer turncancel()
-		buf := make([]byte, 1600)
+		readBufLen := 1600
+		if wc != nil {
+			readBufLen = wrapMaxWire(1600)
+		}
+		buf := make([]byte, readBufLen)
+		plain := make([]byte, 1600)
 		for {
 			n, _, err1 := relayConn.ReadFrom(buf)
 			if err1 != nil {
@@ -1698,7 +1965,16 @@ func oneTurnConnection(ctx context.Context, turnParams *turnParams, peer *net.UD
 			}
 
 			if addr, ok := addr1.(net.Addr); ok {
-				if _, err := conn2.WriteTo(buf[:n], addr); err != nil {
+				payload := buf[:n]
+				if wc != nil {
+					m, wrapErr := wc.unwrapPacket(payload, plain)
+					if wrapErr != nil {
+						log.Printf("[STREAM %d] UNWRAP failed: %v (n=%d)", streamID, wrapErr, n)
+						continue
+					}
+					payload = plain[:m]
+				}
+				if _, err := conn2.WriteTo(payload, addr); err != nil {
 					return
 				}
 			}
@@ -1784,6 +2060,13 @@ func oneTurnConnectionLoop(ctx context.Context, turnParams *turnParams, peer *ne
 }
 
 func main() {
+	// Build banner — printed as the very first line so users can confirm
+	// they are running the patched binary (issue #182 captcha fix + Android
+	// TLS/CA-bundle fix). If this line is missing from the log, an older
+	// binary is being launched by the wrapper/app.
+	log.Printf("vk-turn-proxy build: captcha-fix=v2 tls-ca-fix=v1 go=%s (issue#182 + HARICA root CA bundle embedded)",
+		runtime.Version())
+
 	ctx, cancel := context.WithCancel(context.Background())
 	globalAppCancel = cancel
 	defer cancel()
@@ -1812,11 +2095,24 @@ func main() {
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
 	debugFlag := flag.Bool("debug", false, "enable debug logging")
 	manualCaptchaFlag := flag.Bool("manual-captcha", false, "skip auto captcha solving, use manual mode immediately")
+	captchaSolverFlag := flag.String("captcha-solver", "", "URL of Playwright-based captcha solver (e.g. http://127.0.0.1:8766). When set, captcha is solved via real headless Chromium, bypassing VK's bot detection. Requires captcha_solver.py running on the host.")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-mimicry AEAD wrap DTLS packets. Peer server must use matching -wrap-key.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
 	flag.Parse()
+
+	if *genWrapKey {
+		key, err := genWrapKeyHex()
+		if err != nil {
+			log.Panicf("gen-wrap-key: %v", err)
+		}
+		fmt.Println(key)
+		return
+	}
 	if *peerAddr == "" {
 		log.Panicf("Need peer address!")
 	}
-	peer, err := net.ResolveUDPAddr("udp", *peerAddr)
+	peer, err := resolveUDPAddr("udp", *peerAddr)
 	if err != nil {
 		panic(err)
 	}
@@ -1827,6 +2123,21 @@ func main() {
 	isDebug = *debugFlag
 	manualCaptcha = *manualCaptchaFlag
 	autoCaptchaSliderPOC = !manualCaptcha
+	captchaSolverURL = *captchaSolverFlag
+	if captchaSolverURL != "" {
+		log.Printf("[Captcha] Playwright solver enabled: %s (will be tried first, then fallback to auto/manual)", captchaSolverURL)
+	}
+
+	if *wrapMode && *direct {
+		log.Panicf("-wrap requires DTLS; remove -no-dtls")
+	}
+	wrapKey, err := decodeWrapKey(*wrapMode, *wrapKeyHex)
+	if err != nil {
+		log.Panicf("%v", err)
+	}
+	if *wrapMode {
+		log.Printf("WRAP mode enabled: SRTP-mimicry AEAD. Peer server must use matching -wrap-key.")
+	}
 
 	var link string
 	var getCreds getCredsFunc
@@ -1866,6 +2177,7 @@ func main() {
 		link:     link,
 		udp:      *udp,
 		getCreds: getCreds,
+		wrapKey:  wrapKey,
 	}
 
 	if *vlessMode {
@@ -2158,7 +2470,7 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		urlport = tp.port
 	}
 	turnServerAddr := net.JoinHostPort(urlhost, urlport)
-	turnServerUDPAddr, err := net.ResolveUDPAddr("udp", turnServerAddr)
+	turnServerUDPAddr, err := resolveUDPAddr("udp", turnServerAddr)
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolve TURN addr: %w", err)
 	}
@@ -2227,7 +2539,15 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 		cleanup()
 		return nil, nil, fmt.Errorf("generate cert: %w", err)
 	}
-	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer}
+	var relayWC *wrapConn
+	if len(tp.wrapKey) == wrapKeyLen {
+		relayWC, err = newWrapConn(tp.wrapKey, false)
+		if err != nil {
+			cleanup()
+			return nil, nil, fmt.Errorf("wrap init: %w", err)
+		}
+	}
+	dtlsPC := &relayPacketConn{relay: relayConn, peer: peer, wc: relayWC}
 	dtlsConn, err := dtls.ClientWithOptions(dtlsPC, peer,
 		dtls.WithCertificates(certificate),
 		dtls.WithInsecureSkipVerify(true),
@@ -2274,14 +2594,38 @@ func createSmuxSession(ctx context.Context, tp *turnParams, peer *net.UDPAddr, i
 type relayPacketConn struct {
 	relay net.PacketConn
 	peer  net.Addr
+	wc    *wrapConn
 }
 
 func (r *relayPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	return r.relay.ReadFrom(b)
+	if r.wc == nil {
+		return r.relay.ReadFrom(b)
+	}
+	buf := make([]byte, wrapMaxWire(len(b)))
+	n, addr, err := r.relay.ReadFrom(buf)
+	if err != nil {
+		return 0, addr, err
+	}
+	m, err := r.wc.unwrapPacket(buf[:n], b)
+	if err != nil {
+		return 0, addr, err
+	}
+	return m, addr, nil
 }
 
 func (r *relayPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	return r.relay.WriteTo(b, r.peer)
+	if r.wc == nil {
+		return r.relay.WriteTo(b, r.peer)
+	}
+	out := make([]byte, wrapMaxWire(len(b)))
+	n, err := r.wc.wrapInto(out, b)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = r.relay.WriteTo(out[:n], r.peer); err != nil {
+		return 0, err
+	}
+	return len(b), nil
 }
 
 func (r *relayPacketConn) Close() error                       { return r.relay.Close() }

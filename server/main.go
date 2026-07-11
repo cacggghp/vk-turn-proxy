@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -19,11 +21,69 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// customResolver uses public DNS servers as fallback for domain resolution.
+var customResolver = &net.Resolver{
+	PreferGo: true,
+	Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+		var d net.Dialer
+		dnsServers := []string{"77.88.8.8:53", "77.88.8.1:53", "8.8.8.8:53", "8.8.4.4:53", "1.1.1.1:53", "1.0.0.1:53"}
+		var lastErr error
+		for _, dns := range dnsServers {
+			conn, err := d.DialContext(ctx, "udp", dns)
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
+	},
+}
+
+// resolveUDPAddr resolves a host:port string to *net.UDPAddr.
+// Works with both IP addresses and domain names.
+func resolveUDPAddr(network, address string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, fmt.Errorf("split host:port %q: %w", address, err)
+	}
+
+	// If host is already an IP address, skip DNS resolution
+	if ip := net.ParseIP(host); ip != nil {
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	// Resolve domain name using custom resolver (public DNS fallback)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	ips, err := customResolver.LookupIP(ctx, "ip4", host)
+	if err != nil || len(ips) == 0 {
+		// Fallback: try system resolver
+		return net.ResolveUDPAddr(network, address)
+	}
+
+	resolved := net.JoinHostPort(ips[0].String(), port)
+	log.Printf("[DNS] resolved %s → %s", host, ips[0].String())
+	return net.ResolveUDPAddr(network, resolved)
+}
+
 func main() {
 	listen := flag.String("listen", "0.0.0.0:56000", "listen on ip:port")
 	connect := flag.String("connect", "", "connect to ip:port")
 	vlessMode := flag.Bool("vless", false, "VLESS mode: forward TCP connections (for VLESS) instead of UDP packets")
+	wrapMode := flag.Bool("wrap", false, "WRAP mode: SRTP-mimicry AEAD wrap. Required when client uses -wrap.")
+	wrapKeyHex := flag.String("wrap-key", "", "32-byte hex-encoded shared key for -wrap (64 hex chars)")
+	genWrapKey := flag.Bool("gen-wrap-key", false, "print a fresh 64-character hex key for -wrap-key and exit")
 	flag.Parse()
+
+	if *genWrapKey {
+		key := make([]byte, wrapKeyLen)
+		if _, err := rand.Read(key); err != nil {
+			log.Panicf("gen-wrap-key: %v", err)
+		}
+		fmt.Println(hex.EncodeToString(key))
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -37,32 +97,53 @@ func main() {
 		log.Fatalf("Exit...\n")
 	}()
 
-	addr, err := net.ResolveUDPAddr("udp", *listen)
+	addr, err := resolveUDPAddr("udp", *listen)
 	if err != nil {
 		panic(err)
 	}
 	if len(*connect) == 0 {
 		log.Panicf("server address is required")
 	}
+	var wrapKey []byte
+	if *wrapMode {
+		if *wrapKeyHex == "" {
+			log.Panicf("-wrap requires -wrap-key")
+		}
+		wrapKey, err = hex.DecodeString(*wrapKeyHex)
+		if err != nil {
+			log.Panicf("-wrap-key invalid hex: %v", err)
+		}
+		if len(wrapKey) != wrapKeyLen {
+			log.Panicf("-wrap-key must decode to %d bytes (got %d)", wrapKeyLen, len(wrapKey))
+		}
+	}
+
+	log.Printf("Starting server listen=%s connect=%s vless=%t wrap=%t", *listen, *connect, *vlessMode, *wrapMode)
+
 	// Generate a certificate and private key to secure the connection
 	certificate, genErr := selfsign.GenerateSelfSigned()
 	if genErr != nil {
 		panic(genErr)
 	}
 
-	//
-	// Everything below is the pion-DTLS API! Thanks for using it ❤️.
-	//
-
-	// Connect to a DTLS server
-	listener, err := dtls.ListenWithOptions(
-		"udp",
-		addr,
+	dtlsOpts := []dtls.ServerOption{
 		dtls.WithCertificates(certificate),
 		dtls.WithExtendedMasterSecret(dtls.RequireExtendedMasterSecret),
 		dtls.WithCipherSuites(dtls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
 		dtls.WithConnectionIDGenerator(dtls.RandomCIDGenerator(8)),
-	)
+	}
+
+	var listener net.Listener
+	if *wrapMode {
+		log.Printf("WRAP mode enabled: listener only accepts clients with matching -wrap-key")
+		wrapListener, werr := listenWrapped(addr, wrapKey)
+		if werr != nil {
+			panic(werr)
+		}
+		listener, err = dtls.NewListenerWithOptions(wrapListener, dtlsOpts...)
+	} else {
+		listener, err = dtls.ListenWithOptions("udp", addr, dtlsOpts...)
+	}
 	if err != nil {
 		panic(err)
 	}
